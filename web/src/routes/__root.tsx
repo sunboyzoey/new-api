@@ -42,6 +42,8 @@ import {
 } from '@/lib/auth-session'
 import { subscribeAuthSessionEvents } from '@/lib/auth-session-sync'
 import { resolveLegacyRoute } from '@/lib/legacy-route'
+import { isPublicPageDisabled } from '@/lib/nav-modules'
+import { statusQueryOptions } from '@/lib/status-query'
 import { useAuthStore } from '@/stores/auth-store'
 
 function RootComponent() {
@@ -114,7 +116,7 @@ export const Route = createRootRouteWithContext<{
   queryClient: QueryClient
 }>()({
   // 应用初始化与路由解析前统一校验会话
-  beforeLoad: async ({ location }) => {
+  beforeLoad: async ({ context, location }) => {
     const legacyTarget = resolveLegacyRoute(location.href)
     if (legacyTarget) {
       throw redirect({ href: legacyTarget, replace: true })
@@ -146,6 +148,19 @@ export const Route = createRootRouteWithContext<{
       }
     } else {
       await authBootstrap
+    }
+
+    if (
+      pathname === '/' ||
+      pathname === '/docs' ||
+      pathname.startsWith('/docs/') ||
+      pathname === '/rankings' ||
+      pathname.startsWith('/rankings/')
+    ) {
+      const status = await context.queryClient.fetchQuery(statusQueryOptions)
+      if (isPublicPageDisabled(pathname, status)) {
+        throw redirect({ to: '/dashboard', replace: true })
+      }
     }
   },
   component: RootComponent,

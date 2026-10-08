@@ -122,6 +122,32 @@ func HeaderNavModuleAuth(module string) gin.HandlerFunc {
 	}
 }
 
+// RedirectDisabledPublicPages applies navigation settings to direct page visits.
+func RedirectDisabledPublicPages() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
+			return
+		}
+		path := c.Request.URL.Path
+		module := ""
+		switch {
+		case path == "/":
+			module = "home"
+		case path == "/docs" || strings.HasPrefix(path, "/docs/"):
+			module = "docs"
+		case path == "/rankings" || strings.HasPrefix(path, "/rankings/"):
+			module = "rankings"
+		default:
+			return
+		}
+		if !getHeaderNavAccess(module).Enabled {
+			c.Header("Cache-Control", "no-store")
+			c.Redirect(http.StatusFound, "/dashboard")
+			c.Abort()
+		}
+	}
+}
+
 func HeaderNavModulePublicOrUserAuth(module string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		access := getHeaderNavAccess(module)

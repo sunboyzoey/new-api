@@ -144,6 +144,21 @@ export function parseHeaderNavModulesFromStatus(
   return parseHeaderNavModules(status?.HeaderNavModules)
 }
 
+export function isPublicPageDisabled(
+  pathname: string,
+  status: Record<string, unknown> | null
+): boolean {
+  const modules = parseHeaderNavModulesFromStatus(status)
+  if (pathname === '/') return !modules.home
+  if (pathname === '/docs' || pathname.startsWith('/docs/')) {
+    return !modules.docs
+  }
+  if (pathname === '/rankings' || pathname.startsWith('/rankings/')) {
+    return !modules.rankings.enabled
+  }
+  return false
+}
+
 /**
  * Resolve one module's access flags from an already-loaded status payload.
  *

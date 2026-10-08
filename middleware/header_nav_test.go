@@ -1,8 +1,10 @@
 package middleware
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
@@ -188,4 +191,32 @@ func TestHeaderNavPublicRouteRejectsExpiredInternalAccessToken(t *testing.T) {
 
 	require.Equal(t, http.StatusUnauthorized, response.Code)
 	require.Contains(t, response.Body.String(), "AUTH_TOKEN_EXPIRED")
+}
+
+func TestDisabledPublicPagesRedirectWithoutBlockingConsoleOrAPIs(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		raw := `{"home":false,"docs":false,"rankings":{"enabled":false}}`
+		if enabled {
+			raw = `{"home":true,"docs":true,"rankings":{"enabled":true}}`
+		}
+		t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
+			withHeaderNavModules(t, raw)
+			router := gin.New()
+			router.NoRoute(RedirectDisabledPublicPages(), func(c *gin.Context) { c.Status(http.StatusOK) })
+			for _, path := range []string{"/", "/?aff=test", "/docs", "/docs/", "/docs/getting-started", "/rankings", "/rankings/?period=week", "/dashboard", "/sign-in", "/api/status", "/api/rankings", "/static/js/index.js", "/docs-other", "/rankings-other"} {
+				for _, method := range []string{http.MethodGet, http.MethodHead} {
+					recorder := httptest.NewRecorder()
+					router.ServeHTTP(recorder, httptest.NewRequest(method, path, nil))
+					blocked := !enabled && (path == "/" || strings.HasPrefix(path, "/?") || path == "/docs" || strings.HasPrefix(path, "/docs/") || path == "/rankings" || strings.HasPrefix(path, "/rankings/"))
+					if blocked {
+						assert.Equal(t, http.StatusFound, recorder.Code, path)
+						assert.Equal(t, "/dashboard", recorder.Header().Get("Location"), path)
+						assert.Equal(t, "no-store", recorder.Header().Get("Cache-Control"), path)
+					} else {
+						assert.Equal(t, http.StatusOK, recorder.Code, path)
+					}
+				}
+			}
+		})
+	}
 }

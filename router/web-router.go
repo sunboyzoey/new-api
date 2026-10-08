@@ -24,6 +24,7 @@ func SetWebRouter(router *gin.Engine, assets WebAssets, pluginDispatcher gin.Han
 
 	router.NoRoute(
 		pluginDispatcher,
+		middleware.RedirectDisabledPublicPages(),
 		middleware.RouteTag("web"),
 		func(c *gin.Context) {
 			// ServeFrontendFiles sends build files already compressed.
