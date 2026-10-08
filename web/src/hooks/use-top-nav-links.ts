@@ -55,6 +55,9 @@ export function useTopNavLinks(): TopNavLink[] {
     )
   }, [status])
 
+  // Documentation link (may be external)
+  const docsLink: string | undefined = status?.docs_link as string | undefined
+
   const isAuthed = !!auth?.user
 
   const links: TopNavLink[] = []
@@ -83,9 +86,13 @@ export function useTopNavLinks(): TopNavLink[] {
     links.push({ title: t('Rankings'), href: '/rankings', requiresAuth })
   }
 
-  // Reuse the legacy documentation slot so saved navigation settings still work.
+  // Docs (supports external links)
   if (modules?.docs !== false) {
-    links.push({ title: t('Group monitoring'), href: '/group-monitor' })
+    if (docsLink) {
+      links.push({ title: t('Docs'), href: docsLink, external: true })
+    } else {
+      links.push({ title: t('Docs'), href: '/docs' })
+    }
   }
 
   // About

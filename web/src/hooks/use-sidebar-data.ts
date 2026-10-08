@@ -138,12 +138,6 @@ export function useSidebarData(): SidebarData {
             icon: Radio,
           },
           {
-            title: t('Channel monitoring'),
-            url: '/channel-monitor',
-            icon: Radio,
-            requiredRole: ROLE.ADMIN,
-          },
-          {
             title: t('Models'),
             url: '/models/metadata',
             icon: Box,

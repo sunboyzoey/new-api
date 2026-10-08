@@ -165,8 +165,8 @@ export function HeaderNavigationSection({
     },
     {
       key: 'docs',
-      title: t('Group monitoring'),
-      description: t('Group reliability and response performance'),
+      title: t('Docs'),
+      description: t('Documentation or external knowledge base.'),
     },
     {
       key: 'about',
