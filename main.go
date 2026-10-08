@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -23,6 +24,7 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/oauth"
+	"github.com/QuantumNous/new-api/pkg/channelmonitor"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/pkg/wsmanager"
@@ -63,6 +65,22 @@ func main() {
 		return
 	}
 
+	closeEvaluator, evaluatorErr := controller.InitChannelMonitor()
+	if evaluatorErr != nil {
+		common.FatalLog("channel evaluation initialization failed")
+		return
+	}
+	defer closeEvaluator()
+	monitorShutdown, monitorErr := channelmonitor.Init(context.Background())
+	if monitorErr != nil {
+		common.FatalLog("channel monitoring initialization failed")
+		return
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		_ = monitorShutdown(ctx)
+	}()
 	common.SysLog("New API " + common.Version + " started")
 	if os.Getenv("GIN_MODE") != "debug" {
 		gin.SetMode(gin.ReleaseMode)
@@ -195,6 +213,7 @@ func main() {
 	// This will cause SSE not to work!!!
 	//server.Use(gzip.Gzip(gzip.DefaultCompression))
 	server.Use(middleware.RequestId())
+	server.Use(channelmonitor.Middleware())
 	server.Use(middleware.Version())
 	server.Use(middleware.I18n())
 	middleware.SetUpLogger(server)
@@ -212,7 +231,7 @@ func main() {
 	}
 
 	srv := &http.Server{
-		Addr:    ":" + port,
+		Addr:    net.JoinHostPort(strings.TrimSpace(os.Getenv("BIND_HOST")), port),
 		Handler: server,
 	}
 

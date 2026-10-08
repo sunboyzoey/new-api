@@ -114,8 +114,20 @@ export interface ToolSurchargeItem {
   price: number
 }
 
+export interface CodexTicketSummary {
+  length: number
+  fingerprint: string
+  issued_at?: number
+}
+
+export interface CodexTicketObservation {
+  returned?: CodexTicketSummary
+  used?: CodexTicketSummary
+}
+
 export interface LogOtherData {
   admin_info?: {
+    codex_ticket?: CodexTicketObservation
     request_policy?: PolicyEvent[]
     is_multi_key?: boolean
     multi_key_index?: number

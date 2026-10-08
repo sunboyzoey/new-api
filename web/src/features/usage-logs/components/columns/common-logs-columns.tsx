@@ -71,6 +71,7 @@ import {
   isPerCallBilling,
 } from '../../lib/utils'
 import type { LogOtherData } from '../../types'
+import { CodexTicketBadge } from '../codex-ticket-badge'
 import { DetailsDialog } from '../dialogs/details-dialog'
 import { LogCostDisplay } from '../log-cost-display'
 import { ModelBadge } from '../model-badge'
@@ -666,6 +667,23 @@ export function useCommonLogsColumns(
       },
       size: 160,
     })
+    if (isAdmin) {
+      columns.push({
+        id: 'codex_ticket',
+        header: t('Ticket'),
+        size: 190,
+        cell: ({ row }) => {
+          if (!isDisplayableLogType(row.original.type)) return null
+          return (
+            <CodexTicketBadge
+              ticket={
+                parseLogOther(row.original.other)?.admin_info?.codex_ticket
+              }
+            />
+          )
+        },
+      })
+    }
     columns.push(
       {
         accessorKey: 'model_name',

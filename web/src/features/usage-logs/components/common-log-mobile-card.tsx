@@ -127,6 +127,7 @@ export function CommonLogMobileCard<TData>(props: {
   const costCell = props.cells.get('quota')
   const contentCell = props.cells.get('content')
   const channelCell = props.cells.get('channel')
+  const ticketCell = props.cells.get('codex_ticket')
   const cacheRead = other?.cache_tokens || 0
   const cacheWrite =
     (other?.cache_creation_tokens_5m || 0) +
@@ -217,6 +218,15 @@ export function CommonLogMobileCard<TData>(props: {
             </div>
           )}
       </div>
+      {displayable && ticketCell && (
+        <div className='flex min-w-0 items-center gap-2'>
+          <span className='text-muted-foreground text-xs'>{t('Ticket')}</span>
+          {flexRender(
+            ticketCell.column.columnDef.cell,
+            ticketCell.getContext()
+          )}
+        </div>
+      )}
       {visibleMetadata.length > 0 && (
         <div className='grid min-w-0 grid-cols-2 gap-x-4 gap-y-0.5'>
           {visibleMetadata.map((id) => {

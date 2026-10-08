@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/channelmonitor"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/relay"
@@ -130,6 +131,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if recovered != nil {
 			resultErr = types.NewError(fmt.Errorf("relay panic: %v", recovered), types.ErrorCodeBadResponse)
 		}
+		channelmonitor.FinishRequest(c, relayInfo, resultErr)
 		if relayFormat != types.RelayFormatOpenAIRealtime {
 			perfmetrics.RecordRelayResult(c.Request.Context(), relayInfo, resultErr)
 		}
@@ -184,6 +186,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
 
+		finishMonitorAttempt, _ := channelmonitor.BeginAttempt(c, channel.Id, relayInfo.OriginModelName)
 		switch relayFormat {
 		case types.RelayFormatOpenAIRealtime:
 			newAPIError = relay.WssHelper(c, relayInfo)
@@ -195,6 +198,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			newAPIError = relayHandler(c, relayInfo)
 		}
 
+		finishMonitorAttempt(relayInfo, newAPIError)
 		if newAPIError == nil {
 			service.MarkRequestPolicySuccess(c, relayInfo.StreamStatus)
 			relayInfo.LastError = nil

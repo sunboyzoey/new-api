@@ -32,6 +32,51 @@ import { UsageLogsMobileList } from '../usage-logs-mobile-card'
 import { UsageLogsProvider, useUsageLogsContext } from '../usage-logs-provider'
 
 const longName = 'enterprise-production-failover-2026-without-any-short-alias'
+
+it('shows returned ticket evidence without claiming upstream use on mobile', async () => {
+  const user = userEvent.setup()
+  const fingerprint = 'a91c3f20'.repeat(8)
+  renderLogs({
+    logs: [
+      {
+        ...log,
+        other: JSON.stringify({
+          admin_info: {
+            codex_ticket: { returned: { length: 780, fingerprint } },
+          },
+        }),
+      },
+    ],
+  })
+  await user.click(screen.getByRole('button', { name: 'Ticket: 780' }))
+  expect(await screen.findByText(fingerprint)).toBeVisible()
+  expect(screen.getByText('Ticket(Returned ticket):')).toBeVisible()
+  expect(screen.getByText('Fingerprint:')).toBeVisible()
+  expect(screen.getByText('Issued at:')).toBeVisible()
+  expect(
+    screen.queryByText('Used ticket (upstream report)')
+  ).not.toBeInTheDocument()
+  expect(screen.queryByText('780 characters')).not.toBeInTheDocument()
+})
+
+it('hides ticket metadata from non-admin columns even if supplied in a fixture', () => {
+  renderLogs({
+    admin: false,
+    logs: [
+      {
+        ...log,
+        other: JSON.stringify({
+          admin_info: {
+            codex_ticket: {
+              returned: { length: 780, fingerprint: 'a'.repeat(64) },
+            },
+          },
+        }),
+      },
+    ],
+  })
+  expect(screen.queryByText('Ticket')).not.toBeInTheDocument()
+})
 const log = usageLogSchema.parse({
   id: 1,
   user_id: 2,

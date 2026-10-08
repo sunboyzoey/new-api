@@ -1,16 +1,73 @@
 package channel
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestDoRequestRecordsTicketSummaryWithoutSecretOrStaleAttempt(t *testing.T) {
+	service.InitHttpClient()
+	state := strings.Repeat("s", 780)
+	digest := sha256.Sum256([]byte(state))
+	fingerprint := hex.EncodeToString(digest[:])
+	for _, stream := range []bool{false, true} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("X-Codex-Turn-State", state)
+			w.Header().Set("X-Sub2api-Ticket-Used-Length", "292")
+			w.Header().Set("X-Sub2api-Ticket-Used-Fingerprint", fingerprint)
+			_, _ = w.Write([]byte("{}"))
+		}))
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader([]byte("{}")))
+		req, err := http.NewRequest(http.MethodPost, server.URL, bytes.NewReader([]byte("{}")))
+		require.NoError(t, err)
+		info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}, IsStream: stream}
+		resp, err := doRequest(ctx, req, info)
+		require.NoError(t, err)
+		_ = resp.Body.Close()
+		server.Close()
+		require.NotNil(t, info.CodexTicket.Returned)
+		assert.Equal(t, 780, info.CodexTicket.Returned.Length)
+		assert.Equal(t, fingerprint, info.CodexTicket.Returned.Fingerprint)
+		assert.Equal(t, 292, info.CodexTicket.Used.Length)
+		other := model.NewLogOther()
+		service.AppendRelayLogAdminInfo(ctx, info, other)
+		stored := other.JSONString()
+		assert.NotContains(t, stored, state)
+		var metadata map[string]any
+		require.NoError(t, common.UnmarshalJsonStr(stored, &metadata))
+		assert.NotContains(t, metadata, "codex_ticket")
+		assert.Contains(t, metadata["admin_info"], "codex_ticket")
+		info.InitChannelMeta(ctx)
+		assert.Nil(t, info.CodexTicket)
+		info.ObserveCodexTicketHeaders(http.Header{})
+		require.NotNil(t, info.CodexTicket)
+		assert.Nil(t, info.CodexTicket.Returned)
+		assert.Nil(t, info.CodexTicket.Used)
+	}
+	info := &relaycommon.RelayInfo{}
+	info.ObserveCodexTicketHeaders(http.Header{
+		"X-Codex-Turn-State":                {strings.Repeat("s", 2049)},
+		"X-Sub2api-Ticket-Used-Length":      {"780"},
+		"X-Sub2api-Ticket-Used-Fingerprint": {strings.Repeat("z", 64)},
+	})
+	assert.Nil(t, info.CodexTicket.Returned)
+	assert.Nil(t, info.CodexTicket.Used)
+}
 
 func TestNewTaskAPIRequestInheritsClientCancellation(t *testing.T) {
 	recorder := httptest.NewRecorder()

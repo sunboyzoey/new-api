@@ -62,3 +62,23 @@ func assertChannelRoutePermission(t *testing.T, method string, path string, perm
 	}
 	t.Fatalf("route %s %s not found", method, path)
 }
+
+func TestChannelCollectionPathsWithoutRedirect(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	SetApiRouter(engine)
+	SetDashboardRouter(engine)
+	SetRelayRouter(engine)
+	SetTaskPluginProtocolRouter(engine)
+	SetVideoRouter(engine)
+	SetTaskRouter(engine)
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPut} {
+		for _, path := range []string{"/api/channel", "/api/channel/"} {
+			t.Run(method+path, func(t *testing.T) {
+				recorder := httptest.NewRecorder()
+				engine.ServeHTTP(recorder, httptest.NewRequest(method, path+"?p=1&page_size=20", nil))
+				assert.Equal(t, http.StatusUnauthorized, recorder.Code)
+			})
+		}
+	}
+}

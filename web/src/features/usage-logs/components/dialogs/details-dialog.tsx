@@ -88,6 +88,7 @@ import {
   isTimingLogType,
 } from '../../lib/utils'
 import { USAGE_BILLING_PATH, type LogOtherData } from '../../types'
+import { CodexTicketDetails } from '../codex-ticket-badge'
 import { ResponseModelDetails } from '../model-badge'
 import { PluginAuthorLink } from '../plugin-author-link'
 import { DetailRow, DetailSection } from './log-detail-layout'
@@ -710,6 +711,12 @@ export function DetailsDialog(props: DetailsDialogProps) {
               }
               mono
             />
+          )}
+
+          {props.isAdmin && other?.admin_info?.codex_ticket && (
+            <DetailSection label={t('Ticket')}>
+              <CodexTicketDetails ticket={other.admin_info.codex_ticket} />
+            </DetailSection>
           )}
 
           {showTiming && props.log.use_time > 0 && (
