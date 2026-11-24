@@ -24,33 +24,52 @@ import { parseQuotaFromDollars, quotaUnitsToDollars } from '@/lib/format'
 import type { SubscriptionPlan, PlanPayload } from '../types'
 
 export function getPlanFormSchema(t: TFunction) {
-  return z.object({
-    title: z.string().min(1, t('Please enter plan title')),
-    subtitle: z.string().optional(),
-    price_amount: z.coerce.number().min(0, t('Please enter amount')),
-    duration_unit: z.enum(['year', 'month', 'day', 'hour', 'custom']),
-    duration_value: z.coerce.number().min(1),
-    custom_seconds: z.coerce.number().min(0).optional(),
-    quota_reset_period: z.enum([
-      'never',
-      'daily',
-      'weekly',
-      'monthly',
-      'custom',
-    ]),
-    quota_reset_custom_seconds: z.coerce.number().min(0).optional(),
-    enabled: z.boolean(),
-    sort_order: z.coerce.number(),
-    allow_balance_pay: z.boolean(),
-    allow_wallet_overflow: z.boolean(),
-    max_purchase_per_user: z.coerce.number().min(0),
-    total_amount: z.coerce.number().min(0),
-    upgrade_group: z.string().optional(),
-    downgrade_group: z.string().optional(),
-    stripe_price_id: z.string().optional(),
-    creem_product_id: z.string().optional(),
-    waffo_pancake_product_id: z.string().optional(),
-  })
+  return z
+    .object({
+      title: z.string().min(1, t('Please enter plan title')),
+      subtitle: z.string().optional(),
+      price_amount: z.coerce.number().min(0, t('Please enter amount')),
+      duration_unit: z.enum(['year', 'month', 'day', 'hour', 'custom']),
+      duration_value: z.coerce.number().int().min(1),
+      custom_seconds: z.coerce.number().int().min(0).optional(),
+      quota_reset_period: z.enum([
+        'never',
+        'daily',
+        'weekly',
+        'monthly',
+        'custom',
+      ]),
+      quota_reset_custom_seconds: z.coerce.number().int().min(0).optional(),
+      enabled: z.boolean(),
+      sort_order: z.coerce.number(),
+      allow_balance_pay: z.boolean(),
+      allow_wallet_overflow: z.boolean(),
+      max_purchase_per_user: z.coerce.number().int().min(0),
+      daily_claim_limit: z.coerce.number().int().min(0).max(1000000000),
+      claim_cycle: z.enum(['daily', 'weekly', 'monthly']),
+      max_claims_per_cycle: z.coerce.number().int().min(0).max(1000000000),
+      block_active_claim: z.boolean(),
+      usage_group: z.string().optional(),
+      total_amount: z.coerce.number().min(0),
+      upgrade_group: z.string().optional(),
+      downgrade_group: z.string().optional(),
+      stripe_price_id: z.string().optional(),
+      creem_product_id: z.string().optional(),
+      waffo_pancake_product_id: z.string().optional(),
+    })
+    .superRefine((values, context) => {
+      if (
+        values.price_amount === 0 &&
+        values.duration_unit === 'custom' &&
+        !values.custom_seconds
+      ) {
+        context.addIssue({
+          code: 'custom',
+          path: ['custom_seconds'],
+          message: t('Please enter a valid duration'),
+        })
+      }
+    })
 }
 
 export type PlanFormValues = z.infer<ReturnType<typeof getPlanFormSchema>>
@@ -69,6 +88,11 @@ export const PLAN_FORM_DEFAULTS: PlanFormValues = {
   allow_balance_pay: true,
   allow_wallet_overflow: true,
   max_purchase_per_user: 0,
+  daily_claim_limit: 0,
+  claim_cycle: 'daily',
+  max_claims_per_cycle: 0,
+  block_active_claim: true,
+  usage_group: '',
   total_amount: 0,
   upgrade_group: '',
   downgrade_group: '',
@@ -92,6 +116,11 @@ export function planToFormValues(plan: SubscriptionPlan): PlanFormValues {
     allow_balance_pay: plan.allow_balance_pay !== false,
     allow_wallet_overflow: plan.allow_wallet_overflow !== false,
     max_purchase_per_user: Number(plan.max_purchase_per_user || 0),
+    daily_claim_limit: Number(plan.daily_claim_limit || 0),
+    claim_cycle: plan.claim_cycle || 'daily',
+    max_claims_per_cycle: Number(plan.max_claims_per_cycle || 0),
+    block_active_claim: plan.block_active_claim ?? false,
+    usage_group: plan.usage_group || '',
     total_amount: quotaUnitsToDollars(Number(plan.total_amount || 0)),
     upgrade_group: plan.upgrade_group || '',
     downgrade_group: plan.downgrade_group || '',

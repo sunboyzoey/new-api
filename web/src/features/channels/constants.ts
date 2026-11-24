@@ -23,6 +23,14 @@ For commercial licensing, please contact support@quantumnous.com
 
 export const CHANNEL_TYPE_OLLAMA = 4
 
+export const CHANNEL_QUOTA_FORMAT_OPTIONS = {
+  digitsLarge: 0,
+  digitsSmall: 0,
+  abbreviate: false,
+  // Allow small balances to round to zero instead of forcing one whole unit.
+  minimumNonZero: Number.MIN_VALUE,
+} as const
+
 export const CHANNEL_TYPE_SUB2API = 59
 
 export const CHANNEL_TYPE_NEW_API = 60

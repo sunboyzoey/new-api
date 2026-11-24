@@ -209,7 +209,7 @@ func effectiveModelPricing(values map[string]map[string]any, name string) Pricin
 	result["CompletionRatio"] = ratio_setting.ResolveCompletionRatio(name, configuredCompletion).Ratio
 	for key, fallback := range map[string]float64{
 		"CacheRatio":       ratio_setting.DefaultCacheRatio,
-		"CreateCacheRatio": ratio_setting.DefaultCreateCacheRatio,
+		"CreateCacheRatio": ratio_setting.GetDefaultCreateCacheRatio(name),
 		"ImageRatio":       ratio_setting.DefaultImageRatio,
 	} {
 		if _, exists := result[key]; !exists {

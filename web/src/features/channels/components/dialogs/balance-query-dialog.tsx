@@ -36,7 +36,9 @@ import { handleServerError } from '@/lib/handle-server-error'
 import { createServerError } from '@/lib/server-error-message'
 
 import { getCodexUsage, updateChannelBalance } from '../../api'
+import { CHANNEL_QUOTA_FORMAT_OPTIONS } from '../../constants'
 import { channelsQueryKeys } from '../../lib'
+import { isUnlimitedUpstreamBalance } from '../../lib/upstream-balance'
 import { useChannels } from '../channels-provider'
 import {
   CodexUsageDialog,
@@ -137,11 +139,9 @@ export function BalanceQueryDialog(props: BalanceQueryDialogProps) {
   }
 
   const formatBalance = (bal: number) =>
-    formatCurrencyFromUSD(bal, {
-      digitsLarge: 2,
-      digitsSmall: 4,
-      abbreviate: false,
-    })
+    isUnlimitedUpstreamBalance({ ...currentRow, balance: bal })
+      ? t('Unlimited')
+      : formatCurrencyFromUSD(bal, CHANNEL_QUOTA_FORMAT_OPTIONS)
 
   const formatDate = (timestamp: number) => {
     if (!timestamp) return 'Never'

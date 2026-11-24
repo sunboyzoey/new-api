@@ -84,6 +84,9 @@ func rootAPIError(apiErr *types.NewAPIError) *types.NewAPIError {
 
 func classifyFailure(local bool, code, errorType string, status int) Outcome {
 	code, errorType = strings.ToLower(code), strings.ToLower(errorType)
+	if status == 499 && code == "client_disconnected" {
+		return OutcomeIgnored
+	}
 	if local {
 		if strings.HasPrefix(code, "violation_fee.") {
 			return OutcomeIgnored

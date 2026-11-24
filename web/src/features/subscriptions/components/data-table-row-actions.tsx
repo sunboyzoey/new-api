@@ -63,7 +63,9 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
             <Button
               variant='ghost'
               size='icon-sm'
-              disabled={!complianceConfirmed}
+              disabled={
+                !complianceConfirmed && row.original.plan.price_amount !== 0
+              }
               onClick={handleEdit}
               aria-label={t('Edit')}
             />
@@ -97,7 +99,9 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
             <Button
               variant='ghost'
               size='icon-sm'
-              disabled={!complianceConfirmed}
+              disabled={
+                !complianceConfirmed && row.original.plan.price_amount !== 0
+              }
               onClick={handleToggleStatus}
               aria-label={toggleLabel}
               className={

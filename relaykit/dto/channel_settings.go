@@ -12,6 +12,8 @@ import (
 )
 
 type ChannelSettings struct {
+	// BalanceSystem selects API-key balance queries; empty preserves provider defaults.
+	BalanceSystem             string `json:"balance_system,omitempty"`
 	TaskPluginKey             string `json:"task_plugin_key,omitempty"`
 	ForceFormat               bool   `json:"force_format,omitempty"`
 	ThinkingToContent         bool   `json:"thinking_to_content,omitempty"`

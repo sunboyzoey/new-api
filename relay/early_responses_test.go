@@ -716,6 +716,47 @@ func TestEarlyResponsesStreamFailures(t *testing.T) {
 	}
 }
 
+type disconnectedResponsesWriter struct{ *httptest.ResponseRecorder }
+
+func (disconnectedResponsesWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+func TestManagedResponsesDownstreamDisconnect(t *testing.T) {
+	earlyResponsesSettings(t)
+	const text = "data: " + `{"type":"response.output_text.delta","delta":"hello"}` + "\n\n"
+	const created = "data: " + `{"type":"response.created","response":{"id":"resp_1","output":[]}}` + "\n\n"
+	for _, tc := range []struct {
+		name, wire string
+	}{
+		{"client cancels while awaiting output", ""},
+		{"cannot write first text", text},
+		{"cannot write buffered prelude", created + text},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			var body io.ReadCloser = io.NopCloser(strings.NewReader(tc.wire))
+			if tc.wire == "" {
+				ctx, cancel := context.WithCancel(request.Context())
+				request = request.WithContext(ctx)
+				cancel()
+				reader, writer := io.Pipe()
+				defer writer.Close()
+				body = reader
+			}
+			c, info := earlyResponsesContext(disconnectedResponsesWriter{httptest.NewRecorder()}, request, "", &dto.OpenAIResponsesRequest{Stream: common.GetPointer(true)})
+			info.InitChannelMeta(c)
+			info.ResponsesRetryManaged = true
+			c.Set("responses_retry_managed", true)
+			common.SetContextKey(c, constant.ContextKeyResponsesChannelFailover, true)
+			_, apiErr := openaichannel.OaiResponsesStreamHandler(c, info, &http.Response{StatusCode: http.StatusOK, Body: body})
+			require.NotNil(t, apiErr)
+			assert.Equal(t, 499, apiErr.StatusCode)
+			assert.Equal(t, "client_disconnected", string(apiErr.GetErrorCode()))
+			assert.True(t, types.IsSkipRetryError(apiErr))
+			assert.Equal(t, "stop", service.DecideRelayRetry(c, apiErr, 2).Action)
+		})
+	}
+}
+
 func TestEarlyResponsesClientCancellation(t *testing.T) {
 	earlyResponsesSettings(t)
 	for _, tc := range []struct{ headersFirst, advanced bool }{{false, false}, {true, false}, {false, true}, {true, true}} {

@@ -996,6 +996,9 @@ func (channel *Channel) ValidateSettings() error {
 			return err
 		}
 	}
+	if channelParams.BalanceSystem != "" && channelParams.BalanceSystem != "newapi" && channelParams.BalanceSystem != "sub2api" {
+		return fmt.Errorf("invalid balance_system")
+	}
 	if _, err := common.ParseProxyURLStrict(channelParams.Proxy); err != nil {
 		return fmt.Errorf("invalid channel proxy: %w", err)
 	}

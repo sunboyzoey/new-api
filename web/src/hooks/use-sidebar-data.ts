@@ -29,6 +29,7 @@ import {
   MessageSquare,
   PlugZap,
   Radio,
+  ReceiptText,
   ServerCog,
   Settings,
   ShieldCheck,
@@ -117,6 +118,11 @@ export function useSidebarData(): SidebarData {
             icon: Wallet,
           },
           {
+            title: t('Refund service'),
+            url: '/refund',
+            icon: ReceiptText,
+          },
+          {
             title: t('Profile'),
             url: '/profile',
             icon: User,
@@ -136,6 +142,11 @@ export function useSidebarData(): SidebarData {
             title: t('Channels'),
             url: '/channels',
             icon: Radio,
+          },
+          {
+            title: t('Group cache health'),
+            url: '/group-health',
+            icon: Activity,
           },
           {
             title: t('Models'),

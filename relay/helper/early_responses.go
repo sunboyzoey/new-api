@@ -158,7 +158,10 @@ func SendEarlyResponsesAck(c *gin.Context, info *relaycommon.RelayInfo) error {
 	info.EarlyAckReason = "sent"
 	state.Sequence = 1
 	c.Set("responses_early_ack_committed", true)
-	return ResponseChunkData(c, dto.ResponsesStreamResponse{Type: eventType}, string(data))
+	if err := ResponseChunkData(c, dto.ResponsesStreamResponse{Type: eventType}, string(data)); err != nil {
+		return service.NewDownstreamDisconnectError()
+	}
+	return nil
 }
 
 // SendBufferedResponsesProgress exposes only the existing public lifecycle.

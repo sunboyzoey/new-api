@@ -54,9 +54,9 @@ export function WalletStatsCard(props: WalletStatsCardProps) {
     tone: IconBadgeTone
   }[] = [
     {
-      label: t('Current Balance'),
+      label: t('General wallet balance'),
       value: formatQuota(props.user?.quota ?? 0),
-      description: t('Remaining quota'),
+      description: t('Public rewards are shown separately below'),
       icon: WalletCards,
       tone: 'success',
     },

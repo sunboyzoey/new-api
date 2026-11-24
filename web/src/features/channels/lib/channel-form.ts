@@ -267,6 +267,7 @@ export const channelFormSchema = z
       .string()
       .optional()
       .refine(isOptionalProxyURL, ERROR_MESSAGES.INVALID_PROXY),
+    balance_system: z.enum(['', 'newapi', 'sub2api']).optional(),
     http_protocol: z.enum(['auto', 'http1']).optional(),
     http2_connection_shards: z.number().int().optional(),
     pass_through_body_enabled: z.boolean().optional(),
@@ -458,6 +459,7 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   force_format: false,
   thinking_to_content: false,
   proxy: '',
+  balance_system: '',
   http_protocol: HTTP_PROTOCOL_AUTO,
   http2_connection_shards: 1,
   pass_through_body_enabled: false,
@@ -502,6 +504,7 @@ export function transformChannelToFormDefaults(
     force_format: false,
     thinking_to_content: false,
     proxy: '',
+    balance_system: '' as '' | 'newapi' | 'sub2api',
     http_protocol: HTTP_PROTOCOL_AUTO as 'auto' | 'http1',
     http2_connection_shards: 1,
     pass_through_body_enabled: false,
@@ -523,6 +526,11 @@ export function transformChannelToFormDefaults(
         force_format: parsed.force_format || false,
         thinking_to_content: parsed.thinking_to_content || false,
         proxy: parsed.proxy || '',
+        balance_system:
+          parsed.balance_system === 'newapi' ||
+          parsed.balance_system === 'sub2api'
+            ? parsed.balance_system
+            : '',
         http_protocol: protocol,
         http2_connection_shards: protocol === HTTP_PROTOCOL_HTTP1 ? 1 : shards,
         pass_through_body_enabled: parsed.pass_through_body_enabled || false,
@@ -655,6 +663,7 @@ export function buildSettingJSON(formData: ChannelFormValues): string {
         : undefined,
     force_format: formData.force_format || false,
     thinking_to_content: formData.thinking_to_content || false,
+    balance_system: formData.balance_system || undefined,
     proxy: formData.proxy?.trim() || '',
     pass_through_body_enabled:
       formData.type !== CHANNEL_TYPE_ADVANCED_CUSTOM &&

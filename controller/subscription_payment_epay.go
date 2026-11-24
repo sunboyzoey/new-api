@@ -37,6 +37,10 @@ func SubscriptionRequestEpay(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	if plan.PriceAmount == 0 {
+		common.ApiErrorMsg(c, "Free plans must use the claim endpoint")
+		return
+	}
 	if !plan.Enabled {
 		common.ApiErrorMsg(c, "套餐未启用")
 		return

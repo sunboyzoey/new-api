@@ -4,6 +4,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/gin-gonic/gin"
@@ -198,5 +201,82 @@ func TestAccessTokenVerificationScopesAreAllListed(t *testing.T) {
 	for _, scope := range scopes {
 		_, listed := service.AccessTokenVerificationScope(scope)
 		assert.True(t, listed, "verification scope %s has no access token rule", scope)
+	}
+}
+
+func TestManualPelicanRouteRequiresSameOriginAdmin(t *testing.T) {
+	setupRelayRouterTestDB(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.UserSession{}, &model.Option{}, &model.AuditLog{}, &model.UserAccessToken{}, &model.SystemTask{}))
+	require.NoError(t, model.EnsureLegacyAccessTokenRetireAt(common.GetTimestamp()))
+	t.Setenv("PELICAN_TEST_ENABLED", "true")
+	const origin = "https://dashboard.example"
+	secure, origins := common.SessionCookieSecure, common.SessionCookieTrustedURLs
+	common.SessionCookieSecure, common.SessionCookieTrustedURLs = true, []string{origin}
+	t.Cleanup(func() { common.SessionCookieSecure, common.SessionCookieTrustedURLs = secure, origins })
+
+	// The runner stays stopped. Only the local task queue can be affected.
+	config := model.Option{Key: "PelicanGroupMonitorSecret", Value: `{"enabled":true,"targets":[{"id":"selected","group":"group-A","models":["example"],"enabled":true}]}`}
+	require.NoError(t, model.DB.Create(&config).Error)
+	sessions := make(map[int]*service.AuthBundle)
+	const legacyToken = "fixture-legacy-monitor-token"
+	scopedToken := model.AccessTokenPrefix + strings.Repeat("a", 43)
+	for _, role := range []int{common.RoleCommonUser, common.RoleAdminUser, common.RoleRootUser} {
+		name := "monitor-" + strconv.Itoa(role)
+		user := model.User{Username: name, Role: role, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: name}
+		if role == common.RoleAdminUser {
+			user.SetAccessToken(legacyToken)
+		}
+		require.NoError(t, model.DB.Create(&user).Error)
+		if role == common.RoleAdminUser {
+			token := &model.UserAccessToken{Name: "test fixture", TokenHash: model.AccessTokenFingerprint(scopedToken), TokenHint: model.AccessTokenHint(scopedToken)}
+			require.NoError(t, token.SetScopes([]string{"ops:write"}))
+			require.NoError(t, model.CreateUserAccessToken(user.Id, token, service.AccessTokenMaxPerUser))
+		}
+		session, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "monitor-test")
+		require.NoError(t, err)
+		sessions[role] = session
+	}
+
+	engine := gin.New()
+	SetApiRouter(engine)
+	for _, tc := range []struct {
+		name       string
+		header     string
+		cookie     string
+		origin     string
+		secure     bool
+		wantStatus int
+		wantCount  int64
+		wantCode   string
+	}{
+		{"anonymous", "", "", origin, true, http.StatusUnauthorized, 0, "AUTH_UNAUTHORIZED"},
+		{"refresh cookie alone even in development mode", "", sessions[common.RoleAdminUser].RefreshToken, origin, false, http.StatusUnauthorized, 0, "AUTH_UNAUTHORIZED"},
+		{"ordinary user", sessions[common.RoleCommonUser].AccessToken, "", origin, true, http.StatusForbidden, 0, "AUTH_INSUFFICIENT_PRIVILEGE"},
+		{"legacy admin token", legacyToken, "", origin, true, http.StatusForbidden, 0, "AUTH_SESSION_REQUIRED"},
+		{"scoped admin token", scopedToken, "", origin, true, http.StatusForbidden, 0, "AUTH_SESSION_REQUIRED"},
+		{"untrusted origin", sessions[common.RoleAdminUser].AccessToken, "", "https://other.example", true, http.StatusForbidden, 0, "AUTH_ORIGIN_FORBIDDEN"},
+		{"administrator", sessions[common.RoleAdminUser].AccessToken, "", origin, true, http.StatusOK, 1, ""},
+		{"root administrator", sessions[common.RoleRootUser].AccessToken, "", origin, true, http.StatusOK, 1, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			common.SessionCookieSecure = tc.secure
+			req := httptest.NewRequest(http.MethodPost, origin+"/api/group-health/targets/selected/test", nil)
+			if tc.header != "" {
+				req.Header.Set("Authorization", "Bearer "+tc.header)
+			}
+			if tc.cookie != "" {
+				req.AddCookie(&http.Cookie{Name: service.RefreshCookieName, Value: tc.cookie})
+			}
+			req.Header.Set("Origin", tc.origin)
+			out := httptest.NewRecorder()
+			engine.ServeHTTP(out, req)
+			require.Equal(t, tc.wantStatus, out.Code)
+			if tc.wantCode != "" {
+				assert.Contains(t, out.Body.String(), tc.wantCode)
+			}
+			var count int64
+			require.NoError(t, model.DB.Model(&model.SystemTask{}).Count(&count).Error)
+			assert.Equal(t, tc.wantCount, count)
+		})
 	}
 }

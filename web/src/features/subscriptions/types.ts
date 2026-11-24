@@ -38,6 +38,11 @@ export const subscriptionPlanSchema = z.object({
   allow_balance_pay: z.boolean().optional().default(true),
   allow_wallet_overflow: z.boolean().optional().default(true),
   max_purchase_per_user: z.number(),
+  daily_claim_limit: z.number().int().nonnegative().optional(),
+  claim_cycle: z.enum(['daily', 'weekly', 'monthly']).optional(),
+  max_claims_per_cycle: z.number().int().nonnegative().optional(),
+  block_active_claim: z.boolean().optional(),
+  usage_group: z.string().optional(),
   total_amount: z.number(),
   upgrade_group: z.string().optional(),
   downgrade_group: z.string().optional(),
@@ -50,6 +55,15 @@ export type SubscriptionPlan = z.infer<typeof subscriptionPlanSchema>
 
 export interface PlanRecord {
   plan: SubscriptionPlan
+  claim?: {
+    daily_remaining: number | null
+    daily_refresh_at: number
+    cycle_refresh_at: number
+    lifetime_count: number
+    cycle_count: number
+    can_claim: boolean
+    reason?: string
+  }
 }
 
 // ============================================================================
@@ -62,6 +76,7 @@ export const userSubscriptionSchema = z.object({
   plan_id: z.number(),
   status: z.string(),
   source: z.string().optional(),
+  usage_group: z.string().optional(),
   start_time: z.number(),
   end_time: z.number(),
   amount_total: z.number(),

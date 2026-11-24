@@ -126,6 +126,7 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"GET /api/subscription/plans":                                    accessTokenScopeRule("wallet:read"),
 	"GET /api/subscription/self":                                     accessTokenScopeRule("wallet:read"),
 	"PUT /api/subscription/self/preference":                          accessTokenScopeRule("wallet:write"),
+	"POST /api/subscription/claim":                                   accessTokenScopeRule("wallet:write"),
 	"POST /api/subscription/balance/pay":                             accessTokenScopeRule("wallet:write"),
 	"POST /api/subscription/epay/pay":                                accessTokenScopeRule("wallet:write"),
 	"POST /api/subscription/stripe/pay":                              accessTokenScopeRule("wallet:write"),
@@ -172,6 +173,9 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"DELETE /api/custom-oauth-provider/:id":     accessTokenScopeRule("option:write"),
 	"GET /api/ratio_sync/channels":              accessTokenScopeRule("option:read"),
 	"POST /api/ratio_sync/fetch":                accessTokenScopeRule("option:write"),
+
+	// Triggering a live group test requires an administrator signed into the dashboard.
+	"POST /api/group-health/targets/:id/test": accessTokenSessionRule,
 
 	// router/api-router.go: /api/performance, /api/system-task, /api/system-info
 	"GET /api/performance/stats":                   accessTokenScopeRule("ops:read"),

@@ -23,6 +23,13 @@ import i18next from 'i18next'
 export const safeServerErrorMessage = Symbol('safeServerErrorMessage')
 
 const serverErrorMessageKeys = {
+  PELICAN_TEST_BUSY:
+    'Another group test is in progress. Try again when it finishes.',
+  PELICAN_TEST_DISABLED: 'Group tests are disabled on this server.',
+  PELICAN_TARGET_NOT_FOUND: 'No group found.',
+  PELICAN_TEST_UNAVAILABLE: 'Please try again later.',
+  REGISTRATION_INVITE_INVALID:
+    'Registration requires a valid invitation. Go to the sign-up page and enter your invitation.',
   TELEGRAM_OAUTH_NOT_CONFIGURED:
     'Telegram OAuth is not configured or enabled. Please contact your administrator.',
   TELEGRAM_OAUTH_CONFLICT:

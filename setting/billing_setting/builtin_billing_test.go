@@ -44,8 +44,10 @@ func TestGPT6AstraBuiltinBilling(t *testing.T) {
 	}{
 		{"standard", 1000, 100, 0, 0, `{}`, 7500},
 		{"client flex cannot discount standard pricing", 1000, 100, 0, 0, `{"service_tier":"flex"}`, 7500},
-		{"cache at context boundary", 272000, 1000, 200000, 20000, `{}`, 510000},
-		{"whole request above boundary", 272001, 1000, 200000, 20000, `{}`, 1007510},
+		{"cache at context boundary", 272000, 1000, 200000, 0, `{}`, 485000},
+		{"cache writes use normal input price at boundary", 272000, 1000, 200000, 20000, `{}`, 485000},
+		{"whole request above boundary", 272001, 1000, 200000, 0, `{}`, 957510},
+		{"cache writes use normal input price above boundary", 272001, 1000, 200000, 20000, `{}`, 957510},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			usage := &dto.Usage{

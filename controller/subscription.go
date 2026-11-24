@@ -16,7 +16,8 @@ import (
 // ---- Shared types ----
 
 type SubscriptionPlanDTO struct {
-	Plan model.SubscriptionPlan `json:"plan"`
+	Plan  model.SubscriptionPlan               `json:"plan"`
+	Claim *model.SubscriptionClaimAvailability `json:"claim,omitempty"`
 }
 
 type BillingPreferenceRequest struct {
@@ -30,22 +31,31 @@ type SubscriptionBalancePayRequest struct {
 // ---- User APIs ----
 
 func GetSubscriptionPlans(c *gin.Context) {
-	if !operation_setting.IsPaymentComplianceConfirmed() {
-		common.ApiSuccess(c, []SubscriptionPlanDTO{})
-		return
-	}
-
 	var plans []model.SubscriptionPlan
-	if err := model.DB.Where("enabled = ?", true).Order("sort_order desc, id desc").Find(&plans).Error; err != nil {
+	query := model.DB.Where("enabled = ?", true)
+	if !operation_setting.IsPaymentComplianceConfirmed() {
+		query = query.Where("price_amount = ?", 0)
+	}
+	if err := query.Order("sort_order desc, id desc").Find(&plans).Error; err != nil {
 		common.ApiError(c, err)
 		return
 	}
 	result := make([]SubscriptionPlanDTO, 0, len(plans))
 	for _, p := range plans {
+		if p.IsAutomaticPublicReward() {
+			continue
+		}
 		p.NormalizeDefaults()
-		result = append(result, SubscriptionPlanDTO{
-			Plan: p,
-		})
+		dto := SubscriptionPlanDTO{Plan: p}
+		if p.PriceAmount == 0 {
+			availability, err := model.GetSubscriptionClaimAvailability(model.DB, c.GetInt("id"), &p, model.GetDBTimestamp())
+			if err != nil {
+				common.ApiError(c, err)
+				return
+			}
+			dto.Claim = availability
+		}
+		result = append(result, dto)
 	}
 	common.ApiSuccess(c, result)
 }
@@ -139,13 +149,12 @@ type AdminUpsertSubscriptionPlanRequest struct {
 }
 
 func AdminCreateSubscriptionPlan(c *gin.Context) {
-	if !requirePaymentCompliance(c) {
-		return
-	}
-
 	var req AdminUpsertSubscriptionPlanRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		common.ApiErrorMsg(c, "参数错误")
+		return
+	}
+	if req.Plan.PriceAmount > 0 && !requirePaymentCompliance(c) {
 		return
 	}
 	req.Plan.Id = 0
@@ -185,6 +194,13 @@ func AdminCreateSubscriptionPlan(c *gin.Context) {
 		common.ApiErrorMsg(c, "总额度不能为负数")
 		return
 	}
+	req.Plan.UsageGroup = strings.TrimSpace(req.Plan.UsageGroup)
+	if req.Plan.UsageGroup != "" {
+		if _, ok := ratio_setting.GetGroupRatioCopy()[req.Plan.UsageGroup]; !ok {
+			common.ApiErrorMsg(c, "额度使用分组不存在")
+			return
+		}
+	}
 	req.Plan.UpgradeGroup = strings.TrimSpace(req.Plan.UpgradeGroup)
 	if req.Plan.UpgradeGroup != "" {
 		if _, ok := ratio_setting.GetGroupRatioCopy()[req.Plan.UpgradeGroup]; !ok {
@@ -204,7 +220,23 @@ func AdminCreateSubscriptionPlan(c *gin.Context) {
 		common.ApiErrorMsg(c, "自定义重置周期需大于0秒")
 		return
 	}
-	err := model.DB.Create(&req.Plan).Error
+	if err := model.ValidateSubscriptionClaimRules(&req.Plan); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	enabled := req.Plan.Enabled
+	err := model.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&req.Plan).Error; err != nil {
+			return err
+		}
+		// GORM's default:true fills a false bool during creation. Preserve a draft
+		// inside the transaction so it is never visible as an enabled plan.
+		if !enabled {
+			return tx.Model(&req.Plan).UpdateColumn("enabled", false).Error
+		}
+		return nil
+	})
+	req.Plan.Enabled = enabled
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -214,10 +246,6 @@ func AdminCreateSubscriptionPlan(c *gin.Context) {
 }
 
 func AdminUpdateSubscriptionPlan(c *gin.Context) {
-	if !requirePaymentCompliance(c) {
-		return
-	}
-
 	id, _ := strconv.Atoi(c.Param("id"))
 	if id <= 0 {
 		common.ApiErrorMsg(c, "无效的ID")
@@ -226,6 +254,14 @@ func AdminUpdateSubscriptionPlan(c *gin.Context) {
 	var req AdminUpsertSubscriptionPlanRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		common.ApiErrorMsg(c, "参数错误")
+		return
+	}
+	var existing model.SubscriptionPlan
+	if err := model.DB.First(&existing, id).Error; err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if (req.Plan.PriceAmount > 0 || existing.PriceAmount > 0) && !requirePaymentCompliance(c) {
 		return
 	}
 	if strings.TrimSpace(req.Plan.Title) == "" {
@@ -259,6 +295,13 @@ func AdminUpdateSubscriptionPlan(c *gin.Context) {
 		common.ApiErrorMsg(c, "总额度不能为负数")
 		return
 	}
+	req.Plan.UsageGroup = strings.TrimSpace(req.Plan.UsageGroup)
+	if req.Plan.UsageGroup != "" {
+		if _, ok := ratio_setting.GetGroupRatioCopy()[req.Plan.UsageGroup]; !ok {
+			common.ApiErrorMsg(c, "额度使用分组不存在")
+			return
+		}
+	}
 	req.Plan.UpgradeGroup = strings.TrimSpace(req.Plan.UpgradeGroup)
 	if req.Plan.UpgradeGroup != "" {
 		if _, ok := ratio_setting.GetGroupRatioCopy()[req.Plan.UpgradeGroup]; !ok {
@@ -279,6 +322,10 @@ func AdminUpdateSubscriptionPlan(c *gin.Context) {
 		return
 	}
 
+	if err := model.ValidateSubscriptionClaimRules(&req.Plan); err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	err := model.DB.Transaction(func(tx *gorm.DB) error {
 		// update plan (allow zero values updates with map)
 		updateMap := map[string]any{
@@ -295,6 +342,11 @@ func AdminUpdateSubscriptionPlan(c *gin.Context) {
 			"creem_product_id":           req.Plan.CreemProductId,
 			"waffo_pancake_product_id":   req.Plan.WaffoPancakeProductId,
 			"max_purchase_per_user":      req.Plan.MaxPurchasePerUser,
+			"daily_claim_limit":          req.Plan.DailyClaimLimit,
+			"claim_cycle":                req.Plan.ClaimCycle,
+			"max_claims_per_cycle":       req.Plan.MaxClaimsPerCycle,
+			"block_active_claim":         req.Plan.BlockActiveClaim,
+			"usage_group":                req.Plan.UsageGroup,
 			"total_amount":               req.Plan.TotalAmount,
 			"upgrade_group":              req.Plan.UpgradeGroup,
 			"downgrade_group":            req.Plan.DowngradeGroup,
@@ -326,13 +378,17 @@ type AdminUpdateSubscriptionPlanStatusRequest struct {
 }
 
 func AdminUpdateSubscriptionPlanStatus(c *gin.Context) {
-	if !requirePaymentCompliance(c) {
-		return
-	}
-
 	id, _ := strconv.Atoi(c.Param("id"))
 	if id <= 0 {
 		common.ApiErrorMsg(c, "无效的ID")
+		return
+	}
+	var existing model.SubscriptionPlan
+	if err := model.DB.First(&existing, id).Error; err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if existing.PriceAmount > 0 && !requirePaymentCompliance(c) {
 		return
 	}
 	var req AdminUpdateSubscriptionPlanStatusRequest
@@ -544,4 +600,21 @@ func AdminDeleteUserSubscription(c *gin.Context) {
 		return
 	}
 	common.ApiSuccess(c, nil)
+}
+
+func ClaimFreeSubscription(c *gin.Context) {
+	var req struct {
+		PlanId     int    `json:"plan_id"`
+		RequestKey string `json:"request_key"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.PlanId <= 0 {
+		common.ApiErrorMsg(c, "Invalid free subscription claim")
+		return
+	}
+	result, err := model.ClaimFreeSubscription(c.GetInt("id"), req.PlanId, req.RequestKey)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, result)
 }

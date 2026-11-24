@@ -237,3 +237,16 @@ export async function getGroups(): Promise<ApiResponse<string[]>> {
   const res = await api.get('/api/group')
   return res.data
 }
+
+export async function claimFreeSubscription(data: {
+  plan_id: number
+  request_key: string
+}): Promise<
+  ApiResponse<{
+    subscription: UserSubscriptionRecord['subscription']
+    replayed: boolean
+  }>
+> {
+  const res = await api.post('/api/subscription/claim', data)
+  return res.data
+}

@@ -17,7 +17,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { Crown, CalendarClock, Package } from 'lucide-react'
-import { useState, useEffect } from 'react'
+import { nanoid } from 'nanoid'
+import { useState, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -30,6 +31,7 @@ import { Separator } from '@/components/ui/separator'
 import { useSystemConfig } from '@/hooks/use-system-config'
 import { formatQuota } from '@/lib/format'
 import { handleServerError } from '@/lib/handle-server-error'
+import { getServerErrorMessage } from '@/lib/server-error-message'
 import { DEFAULT_CURRENCY_CONFIG } from '@/stores/system-config-store'
 
 import {
@@ -38,6 +40,7 @@ import {
   paySubscriptionEpay,
   paySubscriptionWaffoPancake,
   paySubscriptionBalance,
+  claimFreeSubscription,
 } from '../../api'
 import { formatDuration, formatResetPeriod } from '../../lib'
 import type { PlanRecord } from '../../types'
@@ -67,6 +70,8 @@ export function SubscriptionPurchaseDialog(props: Props) {
   const { currency } = useSystemConfig()
   const [paying, setPaying] = useState(false)
   const [selectedEpayMethod, setSelectedEpayMethod] = useState('')
+  const claimRequest = useRef<{ planId: number; key: string } | null>(null)
+  const claiming = useRef(false)
 
   useEffect(() => {
     if (props.open && props.epayMethods && props.epayMethods.length > 0) {
@@ -79,6 +84,8 @@ export function SubscriptionPurchaseDialog(props: Props) {
   const plan = props.plan?.plan
   if (!plan) return null
 
+  const isFree = plan.price_amount === 0
+  const claimBlocked = props.plan?.claim?.can_claim === false
   const hasStripe = props.enableStripe && !!plan.stripe_price_id
   const hasCreem = props.enableCreem && !!plan.creem_product_id
   const hasWaffoPancake =
@@ -102,6 +109,42 @@ export function SubscriptionPurchaseDialog(props: Props) {
   const limitReached =
     (props.purchaseLimit || 0) > 0 &&
     (props.purchaseCount || 0) >= (props.purchaseLimit || 0)
+
+  const handleClaim = async () => {
+    if (claiming.current) return
+    claiming.current = true
+    setPaying(true)
+    try {
+      if (claimRequest.current?.planId !== plan.id) {
+        claimRequest.current = { planId: plan.id, key: nanoid() }
+      }
+      const res = await claimFreeSubscription({
+        plan_id: plan.id,
+        request_key: claimRequest.current.key,
+      })
+      if (res.success) {
+        claimRequest.current = null
+        toast.success(t('Free subscription claimed successfully'))
+        void props.onPurchaseSuccess?.()
+        props.onOpenChange(false)
+      } else {
+        handleServerError(res, t('Free subscription claim failed'), {
+          title: t(
+            getServerErrorMessage(res, t('Free subscription claim failed'))
+          ),
+        })
+      }
+    } catch (error) {
+      handleServerError(error, t('Free subscription claim failed'), {
+        title: t(
+          getServerErrorMessage(error, t('Free subscription claim failed'))
+        ),
+      })
+    } finally {
+      claiming.current = false
+      setPaying(false)
+    }
+  }
 
   const handlePayStripe = async () => {
     setPaying(true)
@@ -231,7 +274,7 @@ export function SubscriptionPurchaseDialog(props: Props) {
       title={
         <>
           <Crown className='h-5 w-5' />
-          {t('Purchase Subscription')}
+          {isFree ? t('Claim for free') : t('Purchase Subscription')}
         </>
       }
       contentClassName='max-sm:w-[calc(100vw-1.5rem)] sm:max-w-md'
@@ -299,40 +342,69 @@ export function SubscriptionPurchaseDialog(props: Props) {
           </Alert>
         )}
 
-        <div className='flex flex-col gap-2 rounded-md border p-3'>
-          <div className='flex items-center justify-between gap-2 text-xs'>
-            <span className='text-muted-foreground'>{t('Required')}</span>
-            <span>{formatQuota(balanceCost)}</span>
-          </div>
-          <div className='flex items-center justify-between gap-2 text-xs'>
-            <span className='text-muted-foreground'>{t('Available')}</span>
-            <span>{formatQuota(userQuota)}</span>
-          </div>
-          {!allowBalancePay ? (
-            <Alert variant='destructive'>
-              <AlertDescription>
-                {t('This plan does not allow balance redemption')}
-              </AlertDescription>
-            </Alert>
-          ) : (
-            insufficientBalance && (
-              <Alert variant='destructive'>
-                <AlertDescription>{t('Insufficient balance')}</AlertDescription>
+        {isFree ? (
+          <div className='space-y-3'>
+            <p className='text-muted-foreground text-sm'>
+              {t(
+                'Free to claim. No wallet balance or payment method required.'
+              )}
+            </p>
+            {props.plan?.claim?.reason && (
+              <Alert>
+                <AlertDescription>
+                  {t(props.plan.claim.reason)}
+                </AlertDescription>
               </Alert>
-            )
-          )}
-          <Button
-            variant='outline'
-            onClick={handlePayBalance}
-            disabled={
-              paying || limitReached || !allowBalancePay || insufficientBalance
-            }
-          >
-            {t('Pay with Balance')}
-          </Button>
-        </div>
+            )}
+            <Button
+              className='w-full'
+              onClick={handleClaim}
+              disabled={paying || limitReached || claimBlocked}
+            >
+              {paying ? t('Claiming...') : t('Claim for free')}
+            </Button>
+          </div>
+        ) : (
+          <div className='flex flex-col gap-2 rounded-md border p-3'>
+            <div className='flex items-center justify-between gap-2 text-xs'>
+              <span className='text-muted-foreground'>{t('Required')}</span>
+              <span>{formatQuota(balanceCost)}</span>
+            </div>
+            <div className='flex items-center justify-between gap-2 text-xs'>
+              <span className='text-muted-foreground'>{t('Available')}</span>
+              <span>{formatQuota(userQuota)}</span>
+            </div>
+            {!allowBalancePay ? (
+              <Alert variant='destructive'>
+                <AlertDescription>
+                  {t('This plan does not allow balance redemption')}
+                </AlertDescription>
+              </Alert>
+            ) : (
+              insufficientBalance && (
+                <Alert variant='destructive'>
+                  <AlertDescription>
+                    {t('Insufficient balance')}
+                  </AlertDescription>
+                </Alert>
+              )
+            )}
+            <Button
+              variant='outline'
+              onClick={handlePayBalance}
+              disabled={
+                paying ||
+                limitReached ||
+                !allowBalancePay ||
+                insufficientBalance
+              }
+            >
+              {t('Pay with Balance')}
+            </Button>
+          </div>
+        )}
 
-        {hasAnyPayment && (
+        {!isFree && hasAnyPayment && (
           <div className='space-y-3'>
             <p className='text-muted-foreground text-xs'>
               {t('Select payment method')}

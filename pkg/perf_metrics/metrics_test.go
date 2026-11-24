@@ -40,6 +40,8 @@ func TestClassifyRelayOutcome(t *testing.T) {
 		{"empty upstream response", context.Background(), types.NewError(errors.New("empty"), types.ErrorCodeEmptyResponse), OutcomeFailure},
 		{"network failure", context.Background(), types.NewOpenAIError(errors.New("connection refused"), types.ErrorCodeDoRequestFailed, 500), OutcomeFailure},
 		{"client cancellation", canceled, types.NewOpenAIError(errors.New("context canceled"), types.ErrorCodeDoRequestFailed, 500), OutcomeIgnored},
+		{"downstream write failure", context.Background(), types.WithOpenAIError(types.OpenAIError{Code: "client_disconnected", Type: "client_error"}, 499), OutcomeIgnored},
+		{"upstream failure with status 499", context.Background(), types.InitOpenAIError("upstream_error", 499), OutcomeFailure},
 		{"upstream deadline", context.Background(), types.NewOpenAIError(context.DeadlineExceeded, types.ErrorCodeDoRequestFailed, 504), OutcomeFailure},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -64,6 +66,7 @@ func TestStreamOutcomeClassification(t *testing.T) {
 		{"content filter", func(s *relaycommon.StreamStatus) { s.MarkIncomplete("content_filter") }, relaycommon.StreamEndReasonEOF, OutcomeIgnored},
 		{"client cancel", (*relaycommon.StreamStatus).MarkCancelled, relaycommon.StreamEndReasonEOF, OutcomeIgnored},
 		{"client gone", nil, relaycommon.StreamEndReasonClientGone, OutcomeIgnored},
+		{"downstream delivery failed after upstream EOF", func(s *relaycommon.StreamStatus) { s.MarkFailed("client_disconnected", "client_error", 499) }, relaycommon.StreamEndReasonEOF, OutcomeIgnored},
 		{"timeout", nil, relaycommon.StreamEndReasonTimeout, OutcomeFailure},
 		{"missing terminal", nil, relaycommon.StreamEndReasonEOF, OutcomeFailure},
 		{"done marker without terminal", nil, relaycommon.StreamEndReasonDone, OutcomeSuccess},

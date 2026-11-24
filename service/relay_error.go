@@ -31,6 +31,9 @@ func DecideRelayRetry(c *gin.Context, err *types.NewAPIError, retryTimes int) Po
 		}
 		return PolicyDecision{Action: "stop", Reason: "client_cancelled", Source: "system"}
 	}
+	if err.StatusCode == 499 && err.GetErrorCode() == "client_disconnected" {
+		return PolicyDecision{Action: "stop", Reason: "client_disconnected", Source: "downstream"}
+	}
 	prefixRecovery := c.GetBool("responses_retry_managed") && common.GetContextKeyBool(c, constant.ContextKeyResponsesPrefixRecovery)
 	if c.GetBool("responses_content_delivered") && !prefixRecovery {
 		return PolicyDecision{Action: "stop", Reason: "content_delivered", Source: "system"}
@@ -225,11 +228,19 @@ func NormalizeResponsesRetryError(err *types.NewAPIError) *types.NewAPIError {
 	return err
 }
 
+// NewDownstreamDisconnectError identifies a cancelled or unwritable client stream.
+func NewDownstreamDisconnectError() *types.NewAPIError {
+	return types.WithOpenAIError(types.OpenAIError{Code: "client_disconnected", Type: "client_error", Message: "The downstream connection closed."}, 499, types.ErrOptionWithSkipRetry())
+}
+
 // FinalRelayStreamError describes a terminal failure for the request log when
 // the adaptor already finished the response and settled any delivered usage.
 func FinalRelayStreamError(stream *relaycommon.StreamStatus) *types.NewAPIError {
 	outcome := stream.OutcomeSnapshot()
 	if outcome.Response == relaycommon.ResponseOutcomeFailed {
+		if outcome.ErrorStatus == 499 && outcome.ErrorCode == "client_disconnected" {
+			return NewDownstreamDisconnectError()
+		}
 		code := outcome.ErrorCode
 		if code == "" {
 			code = "upstream_error"
@@ -247,7 +258,7 @@ func FinalRelayStreamError(stream *relaycommon.StreamStatus) *types.NewAPIError 
 	case relaycommon.StreamEndReasonTimeout:
 		return types.WithOpenAIError(types.OpenAIError{Code: "stream_timeout", Message: "The response stream timed out."}, http.StatusGatewayTimeout)
 	case relaycommon.StreamEndReasonClientGone, relaycommon.StreamEndReasonPingFail:
-		return types.WithOpenAIError(types.OpenAIError{Code: "client_disconnected", Message: "The downstream connection closed."}, 499)
+		return NewDownstreamDisconnectError()
 	case relaycommon.StreamEndReasonScannerErr, relaycommon.StreamEndReasonPanic:
 		return types.WithOpenAIError(types.OpenAIError{Code: "stream_interrupted", Message: "The response stream was interrupted."}, http.StatusBadGateway)
 	}

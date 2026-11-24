@@ -506,6 +506,13 @@ func fetchAdvancedCustomBalance(channel *model.Channel) (channelBalanceResult, e
 }
 
 func updateChannelBalance(channel *model.Channel) (channelBalanceResult, error) {
+	if channelBalanceSystem(channel) != "" {
+		balance, err := fetchUpstreamBalance(channel)
+		if err == nil {
+			channel.UpdateBalance(balance)
+		}
+		return channelBalanceResult{Balance: balance}, err
+	}
 	if channel.Type == constant.ChannelTypeAdvancedCustom {
 		return fetchAdvancedCustomBalance(channel)
 	}
@@ -617,12 +624,15 @@ func UpdateChannelBalance(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
-func updateAllChannelsBalance() error {
+func updateAllChannelsBalance(skipUpstreamSystems bool) error {
 	channels, err := model.GetAllChannels(0, 0, true, false)
 	if err != nil {
 		return err
 	}
 	for _, channel := range channels {
+		if skipUpstreamSystems && channelBalanceSystem(channel) != "" {
+			continue
+		}
 		if channel.Status != common.ChannelStatusEnabled {
 			continue
 		}
@@ -638,7 +648,7 @@ func updateAllChannelsBalance() error {
 			continue
 		} else if result.RawResponse == "" {
 			// err is nil & balance <= 0 means quota is used up
-			if result.Balance <= 0 {
+			if result.Balance <= 0 && channelBalanceSystem(channel) == "" {
 				service.DisableChannel(*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, "", channel.GetAutoBan()), "余额不足")
 			}
 		}
@@ -649,7 +659,7 @@ func updateAllChannelsBalance() error {
 
 func UpdateAllChannelsBalance(c *gin.Context) {
 	// TODO: make it async
-	err := updateAllChannelsBalance()
+	err := updateAllChannelsBalance(false)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -665,7 +675,7 @@ func AutomaticallyUpdateChannels(frequency int) {
 	for {
 		time.Sleep(time.Duration(frequency) * time.Minute)
 		common.SysLog("updating all channels")
-		_ = updateAllChannelsBalance()
+		_ = updateAllChannelsBalance(true)
 		common.SysLog("channels update done")
 	}
 }

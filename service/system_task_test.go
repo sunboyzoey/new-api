@@ -31,10 +31,11 @@ func withSystemTaskRegistry(t *testing.T, handlers ...SystemTaskHandler) {
 }
 
 type stubScheduledHandler struct {
-	taskType string
-	enabled  bool
-	interval time.Duration
-	onRun    func(ctx context.Context, task *model.SystemTask, runnerID string)
+	taskType     string
+	startCadence bool
+	enabled      bool
+	interval     time.Duration
+	onRun        func(ctx context.Context, task *model.SystemTask, runnerID string)
 }
 
 type stubSystemTaskRunResult struct {
@@ -54,6 +55,8 @@ func (h *stubScheduledHandler) Run(ctx context.Context, task *model.SystemTask, 
 func (h *stubScheduledHandler) Enabled() bool           { return h.enabled }
 func (h *stubScheduledHandler) Interval() time.Duration { return h.interval }
 func (h *stubScheduledHandler) NewPayload() any         { return nil }
+
+func (h *stubScheduledHandler) ScheduleFromStart() bool { return h.startCadence }
 
 func countSystemTasks(t *testing.T, taskType string) int64 {
 	t.Helper()
@@ -231,4 +234,16 @@ func TestEnqueueSystemTaskReportsCreatedAndExistingActive(t *testing.T) {
 	require.True(t, created)
 	require.NotNil(t, second)
 	assert.NotEqual(t, first.TaskID, second.TaskID)
+}
+
+func TestSystemTaskSchedulerStartCadenceDoesNotWaitAfterCompletion(t *testing.T) {
+	truncate(t)
+	handler := &stubScheduledHandler{taskType: "pelican_cadence_fixture", enabled: true, interval: 10 * time.Minute, startCadence: true}
+	withSystemTaskRegistry(t, handler)
+	now := common.GetTimestamp()
+	require.NoError(t, model.DB.Create(&model.SystemTask{TaskID: "old-pelican", Type: handler.taskType, Status: model.SystemTaskStatusSucceeded, CreatedAt: now - 601, UpdatedAt: now}).Error)
+	runSystemTaskScheduler()
+	assert.Equal(t, int64(2), countSystemTasks(t, handler.taskType))
+	runSystemTaskScheduler()
+	assert.Equal(t, int64(2), countSystemTasks(t, handler.taskType), "an active test must prevent overlap")
 }

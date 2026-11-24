@@ -37,6 +37,7 @@ export interface TwoFAPayload {
 }
 
 export interface RegisterPayload {
+  registration_invite?: string
   username: string
   password: string
   email?: string
@@ -131,6 +132,7 @@ export interface SystemStatus {
     privacy_policy_enabled?: boolean
     oauth_register_enabled?: boolean
     register_enabled?: boolean
+    registration_invite_required?: boolean
     password_login_enabled?: boolean
     password_login_encryption_enabled?: boolean
     password_register_enabled?: boolean
@@ -178,6 +180,7 @@ export interface SystemStatus {
   privacy_policy_enabled?: boolean
   oauth_register_enabled?: boolean
   register_enabled?: boolean
+  registration_invite_required?: boolean
   password_login_enabled?: boolean
   password_login_encryption_enabled?: boolean
   password_register_enabled?: boolean

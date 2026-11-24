@@ -23,7 +23,11 @@ import { afterEach, describe, expect, test, vi } from 'vitest'
 import { api, type RefreshOutcome } from '@/lib/api'
 import type { AuthBundle } from '@/stores/auth-store'
 
-import { executeLogout } from './api'
+import {
+  executeLogout,
+  createOAuthAuthorization,
+  wechatLoginByCode,
+} from './api'
 import { useOAuthLogin } from './hooks/use-oauth-login'
 import { consumeOAuthLoginRedirect } from './lib/oauth-callback-mode'
 
@@ -177,5 +181,53 @@ describe('logout coordination', () => {
         refresh: async () => transient,
       })
     ).rejects.toBe(originalError)
+  })
+})
+
+test('OAuth sends invitations only in the login request body, never in browser storage', async () => {
+  const post = vi.spyOn(api, 'post').mockResolvedValue({
+    data: { success: true, data: { flow_token: 'invitation-flow' } },
+  })
+  const storage = vi.spyOn(Storage.prototype, 'setItem')
+  await createOAuthAuthorization(
+    'github',
+    'login',
+    undefined,
+    undefined,
+    undefined,
+    'private-invitation'
+  )
+  expect(post).toHaveBeenLastCalledWith(
+    '/api/oauth/state',
+    expect.objectContaining({
+      registration_invite: 'private-invitation',
+      intent: 'login',
+    }),
+    expect.anything()
+  )
+  await createOAuthAuthorization(
+    'github',
+    'bind',
+    undefined,
+    undefined,
+    undefined,
+    'private-invitation'
+  )
+  expect(post).toHaveBeenLastCalledWith(
+    '/api/oauth/state',
+    expect.objectContaining({ registration_invite: undefined, intent: 'bind' }),
+    expect.anything()
+  )
+  expect(storage).not.toHaveBeenCalled()
+})
+
+test('WeChat sends the invitation in a header rather than URL parameters', async () => {
+  const get = vi
+    .spyOn(api, 'get')
+    .mockResolvedValue({ data: { success: true } })
+  await wechatLoginByCode('wechat-code', 'private-invitation')
+  expect(get).toHaveBeenCalledWith('/api/oauth/wechat', {
+    params: { code: 'wechat-code' },
+    headers: { 'X-Registration-Invite': 'private-invitation' },
   })
 })

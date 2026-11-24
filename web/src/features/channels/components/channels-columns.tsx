@@ -60,6 +60,7 @@ import { truncateText } from '@/lib/utils'
 import { getCodexUsage, updateChannelBalance } from '../api'
 import {
   CHANNEL_STATUS_CONFIG,
+  CHANNEL_QUOTA_FORMAT_OPTIONS,
   CHANNEL_TYPE_TASK_PLUGIN,
   CHANNEL_TYPE_VLLM,
   CHANNEL_TYPE_SGLANG,
@@ -83,6 +84,7 @@ import {
   isTagAggregateRow,
   type TagRow,
 } from '../lib'
+import { isUnlimitedUpstreamBalance } from '../lib/upstream-balance'
 import { parseUpstreamUpdateMeta } from '../lib/upstream-update-utils'
 import type { Channel } from '../types'
 import { ChannelRowActionsLayoutContext } from './channel-row-actions-context'
@@ -325,11 +327,6 @@ function TagWeightCell({ channel }: { channel: TagRow }) {
   )
 }
 
-/**
- * Inline balance/used values longer than this switch to locale-aware compact
- * notation (e.g. "$28万"); the precise value stays available in the tooltip.
- */
-const MAX_INLINE_BALANCE_CHARS = 8
 const SENSITIVE_MASK = '••••'
 
 /**
@@ -357,43 +354,19 @@ export function BalanceCell({ channel }: { channel: Channel }) {
 
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   const balanceFormatOptions = {
-    digitsLarge: 2,
-    digitsSmall: 4,
-    abbreviate: false,
+    ...CHANNEL_QUOTA_FORMAT_OPTIONS,
+    locale,
     showSymbol: layout !== 'card',
   } as const
-  // Precise values are kept for the tooltip; long values are shown compactly inline.
   const usedFull = withSuffix(
-    formatQuotaWithCurrency(usedQuota, {
-      digitsLarge: 2,
-      digitsSmall: 4,
-      abbreviate: true,
-      showSymbol: layout !== 'card',
-    })
+    formatQuotaWithCurrency(usedQuota, balanceFormatOptions)
   )
-  const remainingFull = withSuffix(
-    formatCurrencyFromUSD(balance, balanceFormatOptions)
-  )
-  const usedDisplay =
-    usedFull.length > MAX_INLINE_BALANCE_CHARS
-      ? withSuffix(
-          formatQuotaWithCurrency(usedQuota, {
-            compact: true,
-            locale,
-            showSymbol: layout !== 'card',
-          })
-        )
-      : usedFull
-  const remainingDisplay =
-    remainingFull.length > MAX_INLINE_BALANCE_CHARS
-      ? withSuffix(
-          formatCurrencyFromUSD(balance, {
-            compact: true,
-            locale,
-            showSymbol: layout !== 'card',
-          })
-        )
-      : remainingFull
+  const unlimitedBalance = isUnlimitedUpstreamBalance(channel)
+  const remainingFull = unlimitedBalance
+    ? t('Unlimited')
+    : withSuffix(formatCurrencyFromUSD(balance, balanceFormatOptions))
+  const usedDisplay = usedFull
+  const remainingDisplay = remainingFull
   const usedLabel = `${t('Used:')} ${usedFull}`
   const remainingLabel = `${t('Remaining:')} ${remainingFull}`
   const maskedUsedLabel = `${t('Used:')} ${SENSITIVE_MASK}`
@@ -429,7 +402,7 @@ export function BalanceCell({ channel }: { channel: Channel }) {
   }
 
   // Regular channel row: show used and remaining with click to update
-  const variant = getBalanceVariant(balance)
+  const variant = unlimitedBalance ? 'neutral' : getBalanceVariant(balance)
   const isInferenceChannel =
     channel.type === CHANNEL_TYPE_VLLM || channel.type === CHANNEL_TYPE_SGLANG
   const inferenceStatusLabel =
@@ -467,11 +440,15 @@ export function BalanceCell({ channel }: { channel: Channel }) {
       if (response.success && response.balance !== undefined) {
         toast.success(
           t('Balance updated: {{balance}}', {
-            balance: formatCurrencyFromUSD(response.balance, {
-              digitsLarge: 2,
-              digitsSmall: 4,
-              abbreviate: false,
-            }),
+            balance: isUnlimitedUpstreamBalance({
+              ...channel,
+              balance: response.balance,
+            })
+              ? t('Unlimited')
+              : formatCurrencyFromUSD(response.balance, {
+                  ...CHANNEL_QUOTA_FORMAT_OPTIONS,
+                  locale,
+                }),
           })
         )
         void queryClient.invalidateQueries({

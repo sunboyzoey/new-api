@@ -56,7 +56,8 @@ import type {
   PlanRecord,
   UserSubscriptionRecord,
 } from '@/features/subscriptions/types'
-import { formatQuota } from '@/lib/format'
+import { toIntlLocale } from '@/i18n/languages'
+import { formatQuota, formatNumber } from '@/lib/format'
 import { handleServerError } from '@/lib/handle-server-error'
 import { requireServerSuccess } from '@/lib/server-error-message'
 import { cn } from '@/lib/utils'
@@ -100,7 +101,13 @@ export function SubscriptionPlansCard({
   userQuota,
   onPurchaseSuccess,
 }: SubscriptionPlansCardProps) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
+  const claimTimeFormatter = new Intl.DateTimeFormat(locale, {
+    timeZone: 'Asia/Shanghai',
+    dateStyle: 'short',
+    timeStyle: 'short',
+  })
 
   const [plans, setPlans] = useState<PlanRecord[]>([])
   const [activeSubscriptions, setActiveSubscriptions] = useState<
@@ -162,10 +169,23 @@ export function SubscriptionPlansCard({
     init()
   }, [fetchPlans, fetchSelfSubscription])
 
+  useEffect(() => {
+    const refreshTimes = plans.flatMap((p) =>
+      p.claim ? [p.claim.daily_refresh_at, p.claim.cycle_refresh_at] : []
+    )
+    if (refreshTimes.length === 0) return
+    const refreshAt = Math.min(...refreshTimes)
+    const timer = window.setTimeout(
+      () => void fetchPlans(),
+      Math.max(1000, Math.min(2147483647, refreshAt * 1000 - Date.now() + 250))
+    )
+    return () => window.clearTimeout(timer)
+  }, [plans, fetchPlans])
+
   const handleRefresh = async () => {
     setRefreshing(true)
     try {
-      await fetchSelfSubscription()
+      await Promise.all([fetchSelfSubscription(), fetchPlans()])
     } finally {
       setRefreshing(false)
     }
@@ -192,6 +212,26 @@ export function SubscriptionPlansCard({
 
   const hasActive = activeSubscriptions.length > 0
   const hasAny = allSubscriptions.length > 0
+  const publicRewards = { registration: 0, checkin: 0 }
+  for (const { subscription } of allSubscriptions) {
+    if (
+      subscription.usage_group !== 'public' ||
+      subscription.status !== 'active' ||
+      subscription.end_time <= Date.now() / 1000
+    ) {
+      continue
+    }
+    const remaining = Math.max(
+      0,
+      subscription.amount_total - subscription.amount_used
+    )
+    if (subscription.source === 'free_registration') {
+      publicRewards.registration += remaining
+    }
+    if (subscription.source === 'free_checkin') {
+      publicRewards.checkin += remaining
+    }
+  }
   const isAvailable = loading || plans.length > 0 || hasAny
   const disablePref = !hasActive
   const isSubPref =
@@ -268,6 +308,39 @@ export function SubscriptionPlansCard({
         disableHoverEffect
         contentClassName='space-y-4 sm:space-y-5'
       >
+        <section
+          aria-label={t('Public free quota')}
+          className='rounded-xl border p-3 sm:p-4'
+        >
+          <h3 className='text-sm font-medium'>{t('Public free quota')}</h3>
+          <p className='mt-2 text-2xl font-bold tabular-nums'>
+            {formatQuota(publicRewards.registration + publicRewards.checkin)}
+          </p>
+          <dl className='mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2'>
+            <div>
+              <dt className='text-muted-foreground text-sm'>
+                {t('Registration reward remaining')}
+              </dt>
+              <dd>{formatQuota(publicRewards.registration)}</dd>
+            </div>
+            <div>
+              <dt className='text-muted-foreground text-sm'>
+                {t('Check-in reward remaining')}
+              </dt>
+              <dd>{formatQuota(publicRewards.checkin)}</dd>
+            </div>
+          </dl>
+          <p className='text-muted-foreground mt-3 text-sm'>
+            {t(
+              'Only usable in the public group. Rewards accumulate without daily resets and are separate from your general wallet.'
+            )}
+          </p>
+          <p className='text-muted-foreground mt-1 text-sm'>
+            {t(
+              'Registration rewards are issued automatically. Claim daily check-in rewards from Profile. Use Subscription First or Subscription Only to spend them.'
+            )}
+          </p>
+        </section>
         {/* My subscriptions & billing preference */}
         <div className='rounded-xl border p-3 sm:p-4'>
           <div className='flex flex-wrap items-center justify-between gap-2.5 sm:gap-3'>
@@ -404,12 +477,17 @@ export function SubscriptionPlansCard({
                   const usedAmount = Number(subscription?.amount_used || 0)
                   const remainAmount =
                     totalAmount > 0 ? Math.max(0, totalAmount - usedAmount) : 0
-                  const planTitle =
-                    planTitleMap.get(subscription?.plan_id) || ''
+                  let planTitle = planTitleMap.get(subscription?.plan_id) || ''
+                  if (subscription.source === 'free_registration') {
+                    planTitle = t('Public registration reward')
+                  }
+                  if (subscription.source === 'free_checkin') {
+                    planTitle = t('Public check-in reward')
+                  }
                   const remainDays = getRemainingDays(sub)
                   const usagePercent = getUsagePercent(sub)
                   const now = Date.now() / 1000
-                  const isExpired = (subscription?.end_time || 0) < now
+                  const isExpired = (subscription?.end_time || 0) <= now
                   const isCancelled = subscription?.status === 'cancelled'
                   const isActive =
                     subscription?.status === 'active' && !isExpired
@@ -487,8 +565,8 @@ export function SubscriptionPlansCard({
                             <TooltipTrigger
                               render={<span className='cursor-help' />}
                             >
-                              {formatQuota(usedAmount)}/
-                              {formatQuota(totalAmount)} · {t('Remaining')}{' '}
+                              {formatQuota(totalAmount)} · {t('Used Quota')}:{' '}
+                              {formatQuota(usedAmount)} · {t('Remaining')}:{' '}
                               {formatQuota(remainAmount)}
                             </TooltipTrigger>
                             <TooltipContent>
@@ -497,7 +575,11 @@ export function SubscriptionPlansCard({
                             </TooltipContent>
                           </Tooltip>
                         ) : (
-                          t('Unlimited')
+                          <>
+                            {t('Unlimited')} · {t('Used Quota')}:{' '}
+                            {formatQuota(usedAmount)} · {t('Remaining')}:{' '}
+                            {t('Unlimited')}
+                          </>
                         )}
                         {totalAmount > 0 && (
                           <span className='ml-2'>
@@ -533,7 +615,10 @@ export function SubscriptionPlansCard({
               const isPopular = index === 0 && plans.length > 1
               const limit = Number(plan.max_purchase_per_user || 0)
               const count = planPurchaseCountMap.get(plan.id) || 0
-              const reached = limit > 0 && count >= limit
+              const isFree = plan.price_amount === 0
+              const reached = isFree
+                ? p.claim?.can_claim === false
+                : limit > 0 && count >= limit
 
               const benefits = [
                 `${t('Validity Period')}: ${formatDuration(plan, t)}`,
@@ -543,7 +628,15 @@ export function SubscriptionPlansCard({
                 totalAmount > 0
                   ? `${t('Total Quota')}: ${formatQuota(totalAmount)}`
                   : `${t('Total Quota')}: ${t('Unlimited')}`,
-                limit > 0 ? `${t('Purchase Limit')}: ${limit}` : null,
+                limit > 0
+                  ? `${isFree ? t('Lifetime claim limit') : t('Purchase Limit')}: ${formatNumber(limit, locale)}`
+                  : null,
+                isFree && (plan.max_claims_per_cycle || 0) > 0
+                  ? `${t('Per-user claims per activity cycle')}: ${formatNumber(plan.max_claims_per_cycle || 0, locale)} (${t({ daily: 'Calendar day', weekly: 'Calendar week', monthly: 'Calendar month' }[plan.claim_cycle || 'daily'])})`
+                  : null,
+                plan.usage_group
+                  ? `${t('Quota usage group')}: ${plan.usage_group}`
+                  : null,
                 plan.upgrade_group
                   ? `${t('Upgrade Group')}: ${plan.upgrade_group}`
                   : null,
@@ -597,6 +690,33 @@ export function SubscriptionPlansCard({
                       ))}
                     </div>
 
+                    {isFree && p.claim && (
+                      <div className='text-muted-foreground mb-3 space-y-1 text-xs'>
+                        <p>
+                          {t('Remaining today')}:{' '}
+                          {p.claim.daily_remaining === null
+                            ? t('Unlimited')
+                            : formatNumber(p.claim.daily_remaining, locale)}
+                        </p>
+                        <p>
+                          {t('Daily refresh at {{time}} (Asia/Shanghai)', {
+                            time: claimTimeFormatter.format(
+                              new Date(p.claim.daily_refresh_at * 1000)
+                            ),
+                          })}
+                        </p>
+                        {(plan.max_claims_per_cycle || 0) > 0 && (
+                          <p>
+                            {t('Cycle refresh at {{time}} (Asia/Shanghai)', {
+                              time: claimTimeFormatter.format(
+                                new Date(p.claim.cycle_refresh_at * 1000)
+                              ),
+                            })}
+                          </p>
+                        )}
+                        {p.claim.reason && <p>{t(p.claim.reason)}</p>}
+                      </div>
+                    )}
                     <Separator className='mb-3' />
 
                     {reached ? (
@@ -607,7 +727,9 @@ export function SubscriptionPlansCard({
                           </Button>
                         </TooltipTrigger>
                         <TooltipContent>
-                          {t('Purchase limit reached')} ({count}/{limit})
+                          {isFree
+                            ? t(p.claim?.reason || 'Claim limit reached')
+                            : `${t('Purchase limit reached')} (${count}/${limit})`}
                         </TooltipContent>
                       </Tooltip>
                     ) : (
@@ -619,7 +741,7 @@ export function SubscriptionPlansCard({
                           setPurchaseOpen(true)
                         }}
                       >
-                        {t('Subscribe Now')}
+                        {isFree ? t('Claim for free') : t('Subscribe Now')}
                       </Button>
                     )}
                   </CardContent>
@@ -639,7 +761,7 @@ export function SubscriptionPlansCard({
         onOpenChange={(open) => {
           setPurchaseOpen(open)
           if (!open) {
-            fetchSelfSubscription()
+            void Promise.all([fetchSelfSubscription(), fetchPlans()])
           }
         }}
         plan={selectedPlan}
@@ -649,7 +771,13 @@ export function SubscriptionPlansCard({
         enableOnlineTopUp={enableOnlineTopUp}
         epayMethods={epayMethods}
         userQuota={userQuota}
-        onPurchaseSuccess={onPurchaseSuccess}
+        onPurchaseSuccess={async () => {
+          await Promise.all([
+            fetchSelfSubscription(),
+            fetchPlans(),
+            onPurchaseSuccess?.(),
+          ])
+        }}
         purchaseLimit={
           selectedPlan?.plan?.max_purchase_per_user
             ? Number(selectedPlan.plan.max_purchase_per_user)

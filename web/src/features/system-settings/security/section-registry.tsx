@@ -21,8 +21,14 @@ import { SSRFSection } from '../request-limits/ssrf-section'
 import { TokenLimitSection } from '../request-limits/token-limit-section'
 import type { SecuritySettings } from '../types'
 import { createSectionRegistry } from '../utils/section-registry'
+import { RegistrationInvitesSection } from './registration-invites-section'
 
 const SECURITY_SECTIONS = [
+  {
+    id: 'registration-invites',
+    titleKey: 'Registration invitations',
+    build: () => <RegistrationInvitesSection />,
+  },
   {
     id: 'rate-limit',
     titleKey: 'Rate Limiting',

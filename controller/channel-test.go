@@ -36,9 +36,10 @@ import (
 )
 
 type testResult struct {
-	context     *gin.Context
-	localErr    error
-	newAPIError *types.NewAPIError
+	context      *gin.Context
+	localErr     error
+	newAPIError  *types.NewAPIError
+	responseBody []byte
 }
 
 func normalizeChannelTestEndpoint(channel *model.Channel, endpointType string) string {
@@ -70,6 +71,16 @@ func resolveChannelTestUserID(c *gin.Context) (int, error) {
 }
 
 func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool) testResult {
+	return testChannelWithProbe(ctx, channel, testUserID, testModel, endpointType, isStream, nil)
+}
+
+// Probes reuse protocol conversion and accounting without health mutations.
+type channelProbe struct {
+	Group   string
+	Request dto.Request
+}
+
+func testChannelWithProbe(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool, probe *channelProbe) testResult {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -166,6 +177,10 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	c.Set("channel", channel.Type)
 	c.Set("base_url", channel.GetBaseURL())
 	group, _ := model.GetUserGroup(testUserID, false)
+	if probe != nil {
+		group = probe.Group
+		common.SetContextKey(c, constant.ContextKeyUsingGroup, group)
+	}
 	c.Set("group", group)
 
 	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, testModel)
@@ -228,6 +243,9 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	}
 
 	request := buildTestRequest(testModel, endpointType, channel, isStream)
+	if probe != nil {
+		request = probe.Request
+	}
 
 	info, err := relaycommon.GenRelayInfo(c, relayFormat, request, nil)
 
@@ -463,6 +481,11 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 			}
 		}
 	}
+	if probe != nil && httpResp != nil && httpResp.Body != nil {
+		body := httpResp.Body
+		defer body.Close()
+		httpResp.Body = io.NopCloser(io.LimitReader(body, 1024*1024))
+	}
 	usageA, respErr := adaptor.DoResponse(c, httpResp, info)
 	if respErr != nil {
 		return testResult{
@@ -502,6 +525,9 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	milliseconds := tok.Sub(tik).Milliseconds()
 	consumedTime := float64(milliseconds) / 1000.0
 	other := buildTestLogOther(c, info, priceData, usage, tieredResult)
+	if probe != nil {
+		other.SetPublic("monitor_test", "pelican_svg_v1")
+	}
 	model.RecordConsumeLog(c, testUserID, model.RecordConsumeLogParams{
 		ChannelId:        channel.Id,
 		PromptTokens:     usage.PromptTokens,
@@ -515,11 +541,14 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		Group:            info.UsingGroup,
 		Other:            other,
 	})
-	common.SysLog(fmt.Sprintf("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
+	if probe == nil {
+		common.SysLog(fmt.Sprintf("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
+	}
 	return testResult{
-		context:     c,
-		localErr:    nil,
-		newAPIError: nil,
+		context:      c,
+		localErr:     nil,
+		newAPIError:  nil,
+		responseBody: respBody,
 	}
 }
 

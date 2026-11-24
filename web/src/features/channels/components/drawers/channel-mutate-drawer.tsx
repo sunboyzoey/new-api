@@ -206,6 +206,7 @@ import {
   nextTaskPluginBaseUrl,
 } from '../../lib/task-plugin-base-url'
 import type { Channel } from '../../types'
+import { BalanceSystemSetting } from '../balance-system-setting'
 import { ChannelPluginExtensions } from '../channel-plugin-extensions'
 import { ChannelQuickOptions } from '../channel-quick-options'
 import { ChannelTypeLogo } from '../channel-type-badge'
@@ -297,6 +298,7 @@ const SENSITIVE_FORM_FIELDS = [
   'force_format',
   'thinking_to_content',
   'proxy',
+  'balance_system',
   'http_protocol',
   'http2_connection_shards',
   'pass_through_body_enabled',
@@ -4687,6 +4689,10 @@ export function ChannelMutateDrawer({
                 className='space-y-4 disabled:opacity-60'
               >
                 {taskPollingFields}
+                <BalanceSystemSetting
+                  control={form.control}
+                  disabled={sensitiveLocked}
+                />
                 {proxyFields}
                 {httpProtocolFields}
                 {httpShardsFields}

@@ -41,6 +41,7 @@ import { Label } from '@/components/ui/label'
 import { register, wechatLoginByCode } from '@/features/auth/api'
 import { LegalConsent } from '@/features/auth/components/legal-consent'
 import { OAuthProviders } from '@/features/auth/components/oauth-providers'
+import { RegistrationInviteInput } from '@/features/auth/components/registration-invite-input'
 import { registerFormSchema } from '@/features/auth/constants'
 import { useAuthRedirect } from '@/features/auth/hooks/use-auth-redirect'
 import { useEmailVerification } from '@/features/auth/hooks/use-email-verification'
@@ -61,6 +62,7 @@ export function SignUpForm({
 }: React.HTMLAttributes<HTMLFormElement>) {
   const { t } = useTranslation()
   const [isLoading, setIsLoading] = useState(false)
+  const [registrationInvite, setRegistrationInvite] = useState('')
   const [verificationCode, setVerificationCode] = useState('')
   const [agreedToLegal, setAgreedToLegal] = useState(false)
   const [wechatCode, setWeChatCode] = useState('')
@@ -167,6 +169,7 @@ export function SignUpForm({
         email: data.email || undefined,
         verification_code: verificationCode || undefined,
         aff_code: getAffiliateCode(),
+        registration_invite: registrationInvite,
         turnstile: turnstileToken,
       })
 
@@ -217,7 +220,7 @@ export function SignUpForm({
 
     setIsWeChatSubmitting(true)
     try {
-      const res = await wechatLoginByCode(wechatCode)
+      const res = await wechatLoginByCode(wechatCode, registrationInvite)
       if (res?.success) {
         handleWeChatDialogChange(false)
         if (await handleLoginResult(res.data)) {
@@ -251,6 +254,12 @@ export function SignUpForm({
         className={cn('grid gap-4', className)}
         {...props}
       >
+        {status?.registration_invite_required && (
+          <RegistrationInviteInput
+            value={registrationInvite}
+            onChange={setRegistrationInvite}
+          />
+        )}
         {/* Username Field */}
         <FormField
           control={form.control}
@@ -384,6 +393,7 @@ export function SignUpForm({
 
         {oauthRegisterEnabled && (
           <OAuthProviders
+            registrationInvite={registrationInvite}
             status={status}
             disabled={isLoading || (requiresLegalConsent && !agreedToLegal)}
             onWeChatLogin={hasWeChatLogin ? handleOpenWeChatDialog : undefined}

@@ -96,7 +96,7 @@ export function SubscriptionsMutateDrawer({
 }: Props) {
   const { t } = useTranslation()
   const isEdit = !!currentRow?.plan?.id
-  const { triggerRefresh } = useSubscriptions()
+  const { triggerRefresh, complianceConfirmed } = useSubscriptions()
   const { meta: currencyMeta } = getCurrencyDisplay()
   const tokensOnly = currencyMeta.kind === 'tokens'
   const currencyLabel = getCurrencyLabel()
@@ -160,6 +160,12 @@ export function SubscriptionsMutateDrawer({
     Number(watchedPrice ?? 0) > 0
 
   const onSubmit = async (values: PlanFormValues) => {
+    if (values.price_amount > 0 && !complianceConfirmed) {
+      toast.error(
+        t('Paid plans require confirmation in Payment Gateway settings')
+      )
+      return
+    }
     setIsSubmitting(true)
     try {
       const payload = formValuesToPlanPayload(values)
@@ -339,6 +345,7 @@ export function SubscriptionsMutateDrawer({
                         <Input
                           {...field}
                           type='number'
+                          disabled={!complianceConfirmed}
                           step='0.01'
                           min={0}
                           onChange={(e) =>
@@ -398,6 +405,39 @@ export function SubscriptionsMutateDrawer({
               </div>
 
               <div className='grid grid-cols-1 gap-3 sm:grid-cols-2'>
+                <FormField
+                  control={form.control}
+                  name='usage_group'
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{t('Quota usage group')}</FormLabel>
+                      <FormControl>
+                        <Combobox
+                          options={[
+                            { value: '__none__', label: t('All groups') },
+                            ...groupOptions.map((g) => ({
+                              value: g,
+                              label: g,
+                            })),
+                          ]}
+                          onValueChange={(v) =>
+                            field.onChange(v === '__none__' ? '' : v)
+                          }
+                          value={field.value || ''}
+                          className='w-full'
+                          placeholder={t('All groups')}
+                        />
+                      </FormControl>
+                      <FormDescription>
+                        {t(
+                          'Only requests routed through this group can use the quota. Does not change user membership.'
+                        )}
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+
                 <FormField
                   control={form.control}
                   name='upgrade_group'
@@ -467,7 +507,11 @@ export function SubscriptionsMutateDrawer({
                   name='max_purchase_per_user'
                   render={({ field }) => (
                     <FormItem>
-                      <FormLabel>{t('Purchase Limit')}</FormLabel>
+                      <FormLabel>
+                        {watchedPrice === 0
+                          ? t('Lifetime claim limit')
+                          : t('Purchase Limit')}
+                      </FormLabel>
                       <FormControl>
                         <Input
                           {...field}
@@ -481,13 +525,137 @@ export function SubscriptionsMutateDrawer({
                         />
                       </FormControl>
                       <FormDescription>
-                        {t('0 means unlimited')}
+                        {watchedPrice === 0
+                          ? t(
+                              'Lifetime total; 0 means unlimited. This is separate from the activity cycle limit.'
+                            )
+                          : t('0 means unlimited')}
                       </FormDescription>
                       <FormMessage />
                     </FormItem>
                   )}
                 />
               </div>
+
+              {watchedPrice === 0 && (
+                <SideDrawerSection>
+                  <h3 className='font-medium'>
+                    {t('Free subscription rules')}
+                  </h3>
+                  <p className='text-muted-foreground text-sm'>
+                    {t(
+                      'Price 0 means free. Total quota 0 means unlimited, not zero usage.'
+                    )}
+                  </p>
+                  <div className='grid grid-cols-1 gap-3 sm:grid-cols-2'>
+                    <FormField
+                      control={form.control}
+                      name='daily_claim_limit'
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>
+                            {t('Daily site-wide claim limit')}
+                          </FormLabel>
+                          <FormControl>
+                            <Input
+                              {...field}
+                              type='number'
+                              min={0}
+                              step={1}
+                              onChange={(e) =>
+                                field.onChange(Number(e.target.value))
+                              }
+                            />
+                          </FormControl>
+                          <FormDescription>
+                            {t(
+                              '0 means unlimited. Daily inventory refreshes at midnight in Asia/Shanghai.'
+                            )}
+                          </FormDescription>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={form.control}
+                      name='claim_cycle'
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>{t('Activity claim cycle')}</FormLabel>
+                          <FormControl>
+                            <Combobox
+                              value={field.value}
+                              onValueChange={field.onChange}
+                              options={[
+                                { value: 'daily', label: t('Calendar day') },
+                                { value: 'weekly', label: t('Calendar week') },
+                                {
+                                  value: 'monthly',
+                                  label: t('Calendar month'),
+                                },
+                              ]}
+                            />
+                          </FormControl>
+                          <FormDescription>
+                            {t(
+                              'Calendar periods in Asia/Shanghai; weeks start on Monday. Independent of quota resets.'
+                            )}
+                          </FormDescription>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={form.control}
+                      name='max_claims_per_cycle'
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>
+                            {t('Per-user claims per activity cycle')}
+                          </FormLabel>
+                          <FormControl>
+                            <Input
+                              {...field}
+                              type='number'
+                              min={0}
+                              step={1}
+                              onChange={(e) =>
+                                field.onChange(Number(e.target.value))
+                              }
+                            />
+                          </FormControl>
+                          <FormDescription>
+                            {t(
+                              '0 means unlimited. Only this activity cycle is counted.'
+                            )}
+                          </FormDescription>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={form.control}
+                      name='block_active_claim'
+                      render={({ field }) => (
+                        <FormItem className={sideDrawerSwitchItemClassName()}>
+                          <FormLabel>
+                            {t(
+                              'Block claims while this plan has an active subscription'
+                            )}
+                          </FormLabel>
+                          <FormControl>
+                            <Switch
+                              checked={field.value}
+                              onCheckedChange={field.onChange}
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  </div>
+                </SideDrawerSection>
+              )}
 
               <FormField
                 control={form.control}

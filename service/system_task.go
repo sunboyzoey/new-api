@@ -284,7 +284,11 @@ func runSystemTaskScheduler() {
 			if latest.Status == model.SystemTaskStatusPending || latest.Status == model.SystemTaskStatusRunning {
 				continue // an active row already exists
 			}
-			if now-latest.UpdatedAt < int64(scheduled.Interval().Seconds()) {
+			lastRunAt := latest.UpdatedAt
+			if cadence, ok := scheduled.(interface{ ScheduleFromStart() bool }); ok && cadence.ScheduleFromStart() {
+				lastRunAt = latest.CreatedAt
+			}
+			if now-lastRunAt < int64(scheduled.Interval().Seconds()) {
 				continue // not due yet
 			}
 		}

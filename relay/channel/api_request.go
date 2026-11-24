@@ -478,8 +478,16 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		resp, err = doEarlyResponsesRequest(c, &relayClient, req, info)
 	}
 	if err != nil {
+		var downstreamErr *types.NewAPIError
+		if errors.As(err, &downstreamErr) && downstreamErr.StatusCode == 499 {
+			return nil, downstreamErr
+		}
+		if errors.Is(err, context.Canceled) && errors.Is(c.Request.Context().Err(), context.Canceled) {
+			return nil, service.NewDownstreamDisconnectError()
+		}
 		var transportErr *url.Error
 		if errors.As(err, &transportErr) {
+			service.RequestPolicy(c).RecordTransportError(err)
 			helper.MarkResponsesUpstreamFailure(c)
 		}
 		logger.LogError(c, "do request failed: "+err.Error())

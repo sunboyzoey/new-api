@@ -678,7 +678,7 @@ func (user *User) Insert(inviterId int) error {
 			if err := user.prepareForInsert(tx); err != nil {
 				return err
 			}
-			user.Quota = common.QuotaForNewUser
+			user.Quota = 0
 			user.AffCode = common.GetRandomString(4)
 
 			// 初始化用户设置，包括默认的边栏配置
@@ -715,6 +715,9 @@ func (user *User) finishInsert(inviterId int) {
 	}
 
 	if common.QuotaForNewUser > 0 {
+		if err := GrantPublicRewardSubscription(user.Id, common.QuotaForNewUser, PublicRewardRegistration); err != nil {
+			common.SysError(fmt.Sprintf("failed to grant public registration reward to user %d: %v", user.Id, err))
+		}
 		RecordLog(user.Id, LogTypeSystem, fmt.Sprintf("新用户注册赠送 %s", logger.LogQuota(common.QuotaForNewUser)))
 	}
 	if inviterId != 0 && operation_setting.IsPaymentComplianceConfirmed() {
@@ -742,7 +745,7 @@ func (user *User) InsertWithTx(tx *gorm.DB, inviterId int) error {
 		if err := user.prepareForInsert(tx); err != nil {
 			return err
 		}
-		user.Quota = common.QuotaForNewUser
+		user.Quota = 0
 		user.AffCode = common.GetRandomString(4)
 
 		// 初始化用户设置
@@ -772,6 +775,9 @@ func (user *User) FinalizeOAuthUserCreation(inviterId int) {
 	}
 
 	if common.QuotaForNewUser > 0 {
+		if err := GrantPublicRewardSubscription(user.Id, common.QuotaForNewUser, PublicRewardRegistration); err != nil {
+			common.SysError(fmt.Sprintf("failed to grant public registration reward to user %d: %v", user.Id, err))
+		}
 		RecordLog(user.Id, LogTypeSystem, fmt.Sprintf("新用户注册赠送 %s", logger.LogQuota(common.QuotaForNewUser)))
 	}
 	if inviterId != 0 && operation_setting.IsPaymentComplianceConfirmed() {

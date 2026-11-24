@@ -1,8 +1,14 @@
 package service
 
 import (
+	"context"
+	"errors"
+	"io"
+	"net"
+	"net/http"
 	"slices"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -48,6 +54,7 @@ type RequestPolicyState struct {
 	RuleName          string
 	Successful        bool
 	OutcomeRecorded   bool
+	transportFailure  string
 	mu                sync.Mutex
 	events            []PolicyEvent
 }
@@ -90,8 +97,79 @@ func (s *RequestPolicyState) BeginAttempt(channel *model.Channel, group string) 
 	s.Attempts++
 	s.Successful = false
 	s.OutcomeRecorded = false
+	s.transportFailure = ""
 	s.SelectedGroup = group
 	s.AddEvent(PolicyEvent{ChannelID: channel.Id, Decision: PolicyDecision{Action: "attempt", Reason: "channel_selected", Source: "routing"}})
+}
+
+// RecordTransportError retains only the cause category before the HTTP error
+// is replaced with a client-safe message. Transport errors can contain URLs.
+func (s *RequestPolicyState) RecordTransportError(err error) {
+	s.transportFailure = transportFailureReason(err)
+}
+
+func transportFailureReason(err error) string {
+	var networkError net.Error
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "request_cancelled"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "upstream_connection_refused"
+	case errors.Is(err, syscall.ECONNRESET):
+		return "upstream_connection_reset"
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return "upstream_transport_eof"
+	case errors.As(err, &networkError) && networkError.Timeout():
+		return "upstream_transport_timeout"
+	default:
+		return "upstream_transport_error"
+	}
+}
+
+func (s *RequestPolicyState) failureReason(err *types.NewAPIError, source string, decision PolicyDecision) string {
+	if err.GetErrorCode() == types.ErrorCodeDoRequestFailed {
+		cause := s.transportFailure
+		if cause == "" {
+			cause = transportFailureReason(err)
+		}
+		if cause == "request_cancelled" && decision.Reason == "client_cancelled" {
+			return "downstream_disconnected"
+		}
+		return cause
+	}
+	if source == "local" {
+		return "local_rejection"
+	}
+	switch err.GetErrorCode() {
+	case "server_is_overloaded", "overloaded_error":
+		return "upstream_overloaded"
+	case "auth_unavailable", "upstream_authentication_required", "invalid_api_key":
+		return "upstream_authentication_failed"
+	case "invalid_encrypted_content", "thinking_signature_invalid":
+		return "upstream_state_rejected"
+	case "incomplete_stream":
+		return "upstream_missing_terminal"
+	case "client_disconnected":
+		return "downstream_disconnected"
+	case "rate_limit_exceeded", "rate_limit_error", "turn_rate_limit_exceeded":
+		return "upstream_rate_limited"
+	}
+	if err.StatusCode == http.StatusTooManyRequests {
+		return "upstream_rate_limited"
+	}
+	// Chat and Responses keep their public error codes when reporting these
+	// gateway-generated stream errors. Only recognize their fixed messages.
+	switch err.Error() {
+	case "alternate channel did not reproduce the delivered response prefix", "alternate channel did not reproduce the delivered chat prefix":
+		return "upstream_prefix_mismatch"
+	case "upstream stream ended before a terminal event", "upstream chat stream ended before the public response was completed":
+		return "upstream_missing_terminal"
+	case "upstream chat stream failed or ended before a finish reason", "upstream Responses stream failed or ended before a terminal event":
+		return "upstream_stream_interrupted"
+	case "downstream connection closed":
+		return "downstream_disconnected"
+	}
+	return "upstream_failure"
 }
 
 // RecordPolicyFailure appends the failed attempt and the retry decision made
@@ -111,10 +189,12 @@ func RecordPolicyFailure(c *gin.Context, channelID int, err *types.NewAPIError, 
 		source = "local"
 	}
 	state := RequestPolicy(c)
-	event := PolicyEvent{ChannelID: channelID, Status: err.StatusCode, ErrorCode: string(err.GetErrorCode()), ErrorSource: source, Decision: PolicyDecision{Action: "failure", Reason: "upstream_failure", Source: source}}
-	if source == "local" {
-		event.Decision.Reason = "local_rejection"
+	reason := state.failureReason(err, source, decision)
+	failureSource := source
+	if reason == "downstream_disconnected" {
+		failureSource = "downstream"
 	}
+	event := PolicyEvent{ChannelID: channelID, Status: err.StatusCode, ErrorCode: string(err.GetErrorCode()), ErrorSource: failureSource, Decision: PolicyDecision{Action: "failure", Reason: reason, Source: failureSource}}
 	state.AddEvent(event)
 	event.Decision, event.Health = decision, "unchanged"
 	if source != "local" && c.GetBool("auto_ban") && ShouldDisableChannel(err) {

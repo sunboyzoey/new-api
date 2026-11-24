@@ -172,6 +172,17 @@ type SubscriptionPlan struct {
 	// Max purchases per user (0 = unlimited)
 	MaxPurchasePerUser int `json:"max_purchase_per_user" gorm:"type:int;default:0"`
 
+	// Free-claim policy is independent of subscription quota resets.
+	DailyClaimLimit   int    `json:"daily_claim_limit" gorm:"type:int;not null;default:0"`
+	ClaimCycle        string `json:"claim_cycle" gorm:"type:varchar(16);not null;default:'daily'"`
+	MaxClaimsPerCycle int    `json:"max_claims_per_cycle" gorm:"type:int;not null;default:0"`
+	BlockActiveClaim  bool   `json:"block_active_claim" gorm:"not null;default:false"`
+	IsReward          bool   `json:"is_reward" gorm:"not null;default:false"`
+	RewardType        string `json:"reward_type" gorm:"type:varchar(32);default:''"`
+
+	// Restrict subscription quota to this routing group; empty preserves unrestricted plans.
+	UsageGroup string `json:"usage_group" gorm:"type:varchar(64);default:''"`
+
 	// Upgrade user group after purchase (empty = no change)
 	UpgradeGroup string `json:"upgrade_group" gorm:"type:varchar(64);default:''"`
 
@@ -254,6 +265,9 @@ type UserSubscription struct {
 	Id     int `json:"id"`
 	UserId int `json:"user_id" gorm:"index;index:idx_user_sub_active,priority:1"`
 	PlanId int `json:"plan_id" gorm:"index"`
+
+	// Snapshot the quota scope so later plan edits do not change issued subscriptions.
+	UsageGroup string `json:"usage_group" gorm:"type:varchar(64);default:''"`
 
 	AmountTotal int64 `json:"amount_total" gorm:"type:bigint;not null;default:0"`
 	AmountUsed  int64 `json:"amount_used" gorm:"type:bigint;not null;default:0"`
@@ -536,6 +550,7 @@ func CreateUserSubscriptionFromPlanTx(tx *gorm.DB, userId int, plan *Subscriptio
 	sub := &UserSubscription{
 		UserId:              userId,
 		PlanId:              plan.Id,
+		UsageGroup:          strings.TrimSpace(plan.UsageGroup),
 		AmountTotal:         plan.TotalAmount,
 		AmountUsed:          0,
 		StartTime:           now.Unix(),
@@ -773,6 +788,9 @@ func PurchaseSubscriptionWithBalance(userId int, planId int) error {
 		if plan.PriceAmount < 0 {
 			return errors.New("套餐价格不能为负数")
 		}
+		if plan.PriceAmount == 0 {
+			return errors.New("Free plans must use the claim endpoint")
+		}
 		if plan.AllowBalancePay != nil && !*plan.AllowBalancePay {
 			return errors.New("该套餐不允许使用余额兑换")
 		}
@@ -860,15 +878,24 @@ func GetAllActiveUserSubscriptions(userId int) ([]SubscriptionSummary, error) {
 	return buildSubscriptionSummaries(subs), nil
 }
 
+// subscriptionUsageScope filters by the actual routing group without changing legacy subscriptions.
+func subscriptionUsageScope(tx *gorm.DB, usingGroups []string) *gorm.DB {
+	group := ""
+	if len(usingGroups) > 0 {
+		group = usingGroups[0]
+	}
+	return tx.Where("(usage_group = '' OR usage_group IS NULL OR usage_group = ?)", group)
+}
+
 // HasActiveUserSubscription returns whether the user has any active subscription.
 // This is a lightweight existence check to avoid heavy pre-consume transactions.
-func HasActiveUserSubscription(userId int) (bool, error) {
+func HasActiveUserSubscription(userId int, usingGroups ...string) (bool, error) {
 	if userId <= 0 {
 		return false, errors.New("invalid userId")
 	}
 	now := common.GetTimestamp()
 	var count int64
-	if err := DB.Model(&UserSubscription{}).
+	if err := subscriptionUsageScope(DB.Model(&UserSubscription{}), usingGroups).
 		Where("user_id = ? AND status = ? AND end_time > ?", userId, "active", now).
 		Count(&count).Error; err != nil {
 		return false, err
@@ -879,13 +906,13 @@ func HasActiveUserSubscription(userId int) (bool, error) {
 // UserActiveSubscriptionsAllowWalletOverflow returns whether wallet balance may be used
 // after the user's subscription quota is exhausted. A single active subscription that
 // disallows wallet overflow (allow_wallet_overflow = false) blocks the fallback.
-func UserActiveSubscriptionsAllowWalletOverflow(userId int) (bool, error) {
+func UserActiveSubscriptionsAllowWalletOverflow(userId int, usingGroups ...string) (bool, error) {
 	if userId <= 0 {
 		return false, errors.New("invalid userId")
 	}
 	now := common.GetTimestamp()
 	var strictCount int64
-	if err := DB.Model(&UserSubscription{}).
+	if err := subscriptionUsageScope(DB.Model(&UserSubscription{}), usingGroups).
 		Where("user_id = ? AND status = ? AND end_time > ? AND allow_wallet_overflow = ?",
 			userId, "active", now, false).
 		Count(&strictCount).Error; err != nil {
@@ -1295,7 +1322,7 @@ func maybeResetUserSubscriptionWithPlanTx(tx *gorm.DB, sub *UserSubscription, pl
 }
 
 // PreConsumeUserSubscription pre-consumes from any active subscription total quota.
-func PreConsumeUserSubscription(requestId string, userId int, modelName string, quotaType int, amount int64) (*SubscriptionPreConsumeResult, error) {
+func PreConsumeUserSubscription(requestId string, userId int, modelName string, quotaType int, amount int64, usingGroups ...string) (*SubscriptionPreConsumeResult, error) {
 	if userId <= 0 {
 		return nil, errors.New("invalid userId")
 	}
@@ -1320,7 +1347,10 @@ func PreConsumeUserSubscription(requestId string, userId int, modelName string, 
 				return errors.New("subscription pre-consume already refunded")
 			}
 			var sub UserSubscription
-			if err := tx.Where("id = ?", existing.UserSubscriptionId).First(&sub).Error; err != nil {
+			if existing.UserId != userId {
+				return errors.New("subscription reservation owner mismatch")
+			}
+			if err := subscriptionUsageScope(tx, usingGroups).Where("id = ?", existing.UserSubscriptionId).First(&sub).Error; err != nil {
 				return err
 			}
 			returnValue.UserSubscriptionId = sub.Id
@@ -1332,7 +1362,7 @@ func PreConsumeUserSubscription(requestId string, userId int, modelName string, 
 		}
 
 		var subs []UserSubscription
-		if err := lockForUpdate(tx).
+		if err := subscriptionUsageScope(lockForUpdate(tx), usingGroups).
 			Where("user_id = ? AND status = ? AND end_time > ?", userId, "active", now).
 			Order("end_time asc, id asc").
 			Find(&subs).Error; err != nil {

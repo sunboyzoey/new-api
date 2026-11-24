@@ -7,8 +7,11 @@ DEV_API_SERVICE = new-api
 DEV_POSTGRES_DB = new-api
 DEV_POSTGRES_USER = root
 DEV_SQLITE_PATH ?= one-api.db
+BUILD_OUTPUT ?= ./build/new-api
+BUILD_VERSION ?= $(shell cat VERSION)
+WEB_BUILD_VERSION ?= $(BUILD_VERSION)
 
-.PHONY: all build-web build-all-web start-api dev dev-api dev-api-rebuild dev-web reset-setup test
+.PHONY: all build-web build-all-web build-lowmem build-lowmem-capped start-api dev dev-api dev-api-rebuild dev-web reset-setup test
 
 all: build-all-web start-api
 
@@ -18,6 +21,30 @@ build-web:
 	@cd $(WEB_DIR) && DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$$(cat ../VERSION) bun run build
 
 build-all-web: build-web
+
+# Build the assets before Go embeds them, even when make is invoked with -j.
+build-lowmem: export RAYON_NUM_THREADS = 1
+build-lowmem: export TOKIO_WORKER_THREADS = 1
+build-lowmem: export UV_THREADPOOL_SIZE = 1
+build-lowmem: export MALLOC_ARENA_MAX = 2
+build-lowmem: export NODE_OPTIONS := $(strip $(NODE_OPTIONS) --max-old-space-size=1024)
+build-lowmem: export GOMAXPROCS = 1
+build-lowmem: export GOMEMLIMIT = 768MiB
+build-lowmem: export GOGC = 50
+build-lowmem: export BUILD_VERSION := $(BUILD_VERSION)
+build-lowmem: export WEB_BUILD_VERSION := $(WEB_BUILD_VERSION)
+build-lowmem:
+	cd "$(WEB_DIR)" && bun install --frozen-lockfile --concurrent-scripts=1 --network-concurrency=4
+	@if [ -n "$$WEB_BUILD_VERSION" ]; then export VITE_REACT_APP_VERSION="$$WEB_BUILD_VERSION"; fi; \
+	cd "$(WEB_DIR)" && bun run build --distPath "$(abspath web/dist)"
+	@mkdir -p "$(dir $(BUILD_OUTPUT))"
+	@ldflags='-s -w'; \
+	if [ -n "$$BUILD_VERSION" ]; then ldflags="$$ldflags -X 'github.com/QuantumNous/new-api/common.Version=$$BUILD_VERSION'"; fi; \
+	go build -p=1 -trimpath -ldflags "$$ldflags" -o "$(BUILD_OUTPUT)" .
+
+# Linux/systemd: enforce the limit across Bun, Node, native workers and Go together.
+build-lowmem-capped:
+	systemd-run --scope --quiet -p MemoryHigh=1792M -p MemoryMax=2G -p MemorySwapMax=0 -p CPUQuota=100% $(MAKE) build-lowmem
 
 start-api:
 	@echo "Starting api dev server..."

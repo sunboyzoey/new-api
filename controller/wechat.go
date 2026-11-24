@@ -98,7 +98,11 @@ func WeChatAuth(c *gin.Context) {
 			user.Role = common.RoleCommonUser
 			user.Status = common.UserStatusEnabled
 
-			if err := user.Insert(0); err != nil {
+			if err := user.RegisterWithInvite(0, model.RegistrationInviteHash(c.GetHeader("X-Registration-Invite"))); err != nil {
+				if errors.Is(err, model.ErrRegistrationInviteInvalid) {
+					writeRegistrationInviteError(c)
+					return
+				}
 				c.JSON(http.StatusOK, gin.H{
 					"success": false,
 					"message": err.Error(),

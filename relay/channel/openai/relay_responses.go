@@ -355,7 +355,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 					}
 					if err := helper.SendBufferedResponsesProgress(c, info); err != nil {
 						info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
-						attemptError = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+						attemptError = service.NewDownstreamDisconnectError()
 						sr.Stop(err)
 					}
 					return
@@ -386,7 +386,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 						helper.ExtendWriteDeadline(c)
 						if err := helper.ResponseChunkData(c, event, payload); err != nil {
 							info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
-							return err
+							return service.NewDownstreamDisconnectError()
 						}
 						if info.EarlyResponses.SentAt.IsZero() {
 							if sequence := gjson.Get(payload, "sequence_number"); sequence.Exists() {
@@ -452,7 +452,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 						if streamResponse.Type == "response.in_progress" {
 							if err := helper.SendBufferedResponsesProgress(c, info); err != nil {
 								info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
-								attemptError = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+								attemptError = service.NewDownstreamDisconnectError()
 								sr.Stop(err)
 								return
 							}
@@ -487,7 +487,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 					event.Type = typ
 					if err := helper.ResponseChunkData(c, event, rewritten); err != nil {
 						info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
-						attemptError = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+						attemptError = service.NewDownstreamDisconnectError()
 						sr.Stop(err)
 						return
 					}
@@ -527,7 +527,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		if err := helper.ResponseChunkData(c, streamResponse, data); err != nil {
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
 			if managed {
-				attemptError = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+				attemptError = service.NewDownstreamDisconnectError()
 			}
 			sr.Stop(err)
 			return
@@ -553,16 +553,15 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		// A client may close immediately after receiving a terminal frame.
 		// Once its write and flush succeeded, cancellation cannot undo delivery.
 		clientGone := !terminalDelivered && (c.Request.Context().Err() != nil || outcome.EndReason == relaycommon.StreamEndReasonClientGone || outcome.EndReason == relaycommon.StreamEndReasonPingFail)
-		if attemptError == nil && (clientGone || outcome.Response == relaycommon.ResponseOutcomeUnknown) {
+		if attemptError == nil && clientGone {
+			attemptError = service.NewDownstreamDisconnectError()
+		}
+		if attemptError == nil && outcome.Response == relaycommon.ResponseOutcomeUnknown {
 			switch outcome.EndReason {
 			case relaycommon.StreamEndReasonDone, relaycommon.StreamEndReasonEOF, relaycommon.StreamEndReasonTimeout, relaycommon.StreamEndReasonScannerErr:
 				upstreamFailure = true
 			}
-			message := "upstream stream ended before a terminal event"
-			if clientGone {
-				message = "downstream connection closed"
-			}
-			attemptError = types.WithOpenAIError(types.OpenAIError{Code: "server_error", Type: "server_error", Message: message}, http.StatusBadGateway)
+			attemptError = types.WithOpenAIError(types.OpenAIError{Code: "server_error", Type: "server_error", Message: "upstream stream ended before a terminal event"}, http.StatusBadGateway)
 		}
 		if attemptError != nil {
 			attemptError = service.NormalizeResponsesRetryError(attemptError)

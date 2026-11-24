@@ -1,6 +1,8 @@
 package ratio_setting
 
 import (
+	"strings"
+
 	"github.com/QuantumNous/new-api/types"
 )
 
@@ -86,9 +88,6 @@ var defaultCacheRatio = map[string]float64{
 }
 
 var defaultCreateCacheRatio = map[string]float64{
-	"gpt-5.6-sol":                         1.25,
-	"gpt-5.6-terra":                       1.25,
-	"gpt-5.6-luna":                        1.25,
 	"claude-3-sonnet-20240229":            1.25,
 	"claude-3-opus-20240229":              1.25,
 	"claude-3-haiku-20240307":             1.25,
@@ -172,9 +171,18 @@ func GetCacheRatio(name string) (float64, bool) {
 func GetCreateCacheRatio(name string) (float64, bool) {
 	ratio, ok := createCacheRatioMap.Get(name)
 	if !ok {
-		return DefaultCreateCacheRatio, false
+		return GetDefaultCreateCacheRatio(name), false
 	}
 	return ratio, true
+}
+
+// GetDefaultCreateCacheRatio prices GPT cache writes as ordinary input unless
+// an administrator explicitly configures a different ratio.
+func GetDefaultCreateCacheRatio(name string) float64 {
+	if strings.HasPrefix(strings.ToLower(name), "gpt-") {
+		return 1
+	}
+	return DefaultCreateCacheRatio
 }
 
 func GetCacheRatioCopy() map[string]float64 {

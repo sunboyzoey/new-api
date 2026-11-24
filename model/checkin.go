@@ -67,7 +67,9 @@ func UserCheckin(userId int) (*Checkin, error) {
 		return nil, errors.New("今日已签到")
 	}
 
-	// 计算随机额度奖励
+	// The reward is granted as a public-scoped subscription, so it cannot be
+	// spent through another routing group. Keep the range behavior for existing
+	// installations that intentionally configure a random reward.
 	quotaAwarded := setting.MinQuota
 	if setting.MaxQuota > setting.MinQuota {
 		quotaAwarded = setting.MinQuota + rand.Intn(setting.MaxQuota-setting.MinQuota+1)
@@ -100,10 +102,8 @@ func userCheckinWithTransaction(checkin *Checkin, userId int, quotaAwarded int) 
 			return errors.New("签到失败，请稍后重试")
 		}
 
-		// 步骤2: 在事务中增加用户额度
-		if err := tx.Model(&User{}).Where("id = ?", userId).
-			Update("quota", gorm.Expr("quota + ?", quotaAwarded)).Error; err != nil {
-			return errors.New("签到失败：更新额度出错")
+		if err := grantPublicRewardSubscriptionTx(tx, userId, quotaAwarded, PublicRewardCheckin); err != nil {
+			return errors.New("签到失败：发放公益额度出错")
 		}
 
 		return nil
@@ -113,10 +113,7 @@ func userCheckinWithTransaction(checkin *Checkin, userId int, quotaAwarded int) 
 		return nil, err
 	}
 
-	// 事务成功后，异步更新缓存
-	go func() {
-		_ = cacheIncrUserQuota(userId, int64(quotaAwarded))
-	}()
+	// Public subscription rewards do not change the general wallet or its cache.
 
 	return checkin, nil
 }
@@ -131,7 +128,7 @@ func userCheckinWithoutTransaction(checkin *Checkin, userId int, quotaAwarded in
 
 	// 步骤2: 增加用户额度
 	// 使用 db=true 强制直接写入数据库，不使用批量更新
-	if err := IncreaseUserQuota(userId, quotaAwarded, true); err != nil {
+	if err := GrantPublicRewardSubscription(userId, quotaAwarded, PublicRewardCheckin); err != nil {
 		// 如果增加额度失败，需要回滚签到记录
 		DB.Delete(checkin)
 		return nil, errors.New("签到失败：更新额度出错")

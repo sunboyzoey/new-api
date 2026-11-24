@@ -1,11 +1,14 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"syscall"
 	"testing"
 	"time"
 
@@ -255,4 +258,52 @@ func TestRequestPolicyEventsReachLogAdminInfo(t *testing.T) {
 	other := model.NewLogOther()
 	AppendRelayLogAdminInfo(untouched, nil, other)
 	assert.NotContains(t, other.Snapshot()["admin_info"], "request_policy", "requests without decisions do not carry an empty record")
+}
+
+func TestFailedAttemptLogsSafeCauseAndKeepsRetryDecision(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	state := RequestPolicy(c)
+	const sensitiveURL = "https://private.example/?credential=private-value"
+	for _, tc := range []struct {
+		code      string
+		message   string
+		transport error
+		cancelled bool
+		reason    string
+	}{
+		{code: string(types.ErrorCodeDoRequestFailed), transport: syscall.ECONNREFUSED, reason: "upstream_connection_refused"},
+		{code: string(types.ErrorCodeDoRequestFailed), transport: syscall.ECONNRESET, reason: "upstream_connection_reset"},
+		{code: string(types.ErrorCodeDoRequestFailed), transport: io.ErrUnexpectedEOF, reason: "upstream_transport_eof"},
+		{code: string(types.ErrorCodeDoRequestFailed), transport: context.Canceled, cancelled: true, reason: "downstream_disconnected"},
+		{code: string(types.ErrorCodeDoRequestFailed), reason: "upstream_transport_error"},
+		{code: "server_error", message: "upstream stream ended before a terminal event", reason: "upstream_missing_terminal"},
+		{code: "bad_response", message: "alternate channel did not reproduce the delivered response prefix", reason: "upstream_prefix_mismatch"},
+		{code: "server_is_overloaded", message: "private-value", cancelled: true, reason: "upstream_overloaded"},
+		{code: "server_error", message: "downstream connection closed", reason: "downstream_disconnected"},
+		{code: "server_error", message: sensitiveURL, reason: "upstream_failure"},
+	} {
+		t.Run(tc.reason, func(t *testing.T) {
+			state.BeginAttempt(&model.Channel{Id: 7}, "default")
+			apiErr := types.WithOpenAIError(types.OpenAIError{Code: tc.code, Message: tc.message}, http.StatusBadGateway)
+			if tc.transport != nil {
+				transportErr := &url.Error{Op: "Post", URL: sensitiveURL, Err: tc.transport}
+				state.RecordTransportError(transportErr)
+				apiErr = types.NewError(transportErr, types.ErrorCodeDoRequestFailed, types.ErrOptionWithHideErrMsg("upstream error: do request failed"))
+			}
+			decision := PolicyDecision{Action: "retry", Reason: "upstream_channel_failed", Source: "upstream"}
+			if tc.cancelled {
+				decision = PolicyDecision{Action: "stop", Reason: "client_cancelled", Source: "system"}
+			} else if tc.reason == "downstream_disconnected" {
+				decision = PolicyDecision{Action: "stop", Reason: "non_retryable_error", Source: "system"}
+			}
+			RecordPolicyFailure(c, 7, apiErr, decision)
+			events := state.Events()
+			require.GreaterOrEqual(t, len(events), 3)
+			assert.Equal(t, tc.reason, events[len(events)-2].Decision.Reason)
+			assert.Equal(t, decision, events[len(events)-1].Decision)
+			logJSON, err := common.Marshal(events)
+			require.NoError(t, err)
+			assert.NotContains(t, string(logJSON), "private-value")
+		})
+	}
 }
