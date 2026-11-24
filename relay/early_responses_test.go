@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 	"testing/iotest"
+	"testing/synctest"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -43,6 +44,7 @@ func earlyResponsesSettings(t *testing.T) {
 	timeout := constant.StreamingTimeout
 	settings.ResponsesEarlyAckEnabled = true
 	settings.ResponsesEarlyAckDelayMS = operation_setting.DefaultResponsesEarlyAckDelayMS
+	settings.ResponsesEarlyAckMaxDelayMS = 0
 	settings.PingIntervalEnabled = false
 	constant.StreamingTimeout = 10
 	t.Cleanup(func() { *settings = old; constant.StreamingTimeout = timeout })
@@ -257,6 +259,53 @@ func TestEarlyResponsesEligibility(t *testing.T) {
 			helper.PrepareEarlyResponses(info, body)
 			defer info.EarlyResponses.Stop()
 			assert.Equal(t, tc.want, info.EarlyResponses != nil)
+		})
+	}
+}
+
+func TestEarlyResponsesAckDeadlineAcrossRetries(t *testing.T) {
+	earlyResponsesSettings(t)
+	settings := operation_setting.GetGeneralSetting()
+	for _, tc := range []struct {
+		name                 string
+		minMS, maxMS         int
+		wantMinMS, wantMaxMS int
+	}{
+		{"legacy fixed delay", 125, 0, 125, 125},
+		{"production range", 500, 1000, 500, 1000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				settings.ResponsesEarlyAckDelayMS = tc.minMS
+				settings.ResponsesEarlyAckMaxDelayMS = tc.maxMS
+				info := &relaycommon.RelayInfo{
+					IsStream:              true,
+					ResponsesRetryManaged: true,
+					StartTime:             time.Now(),
+					RelayMode:             relayconstant.RelayModeResponses,
+					RelayFormat:           types.RelayFormatOpenAIResponses,
+					ChannelMeta:           &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenAI},
+				}
+				body, closer, err := relaycommon.NewOutboundJSONBody([]byte(`{"stream":true}`))
+				require.NoError(t, err)
+				defer closer.Close()
+				helper.PrepareEarlyResponses(info, body)
+				require.NotNil(t, info.EarlyResponses)
+				deadline := info.EarlyAckDeadline
+				delay := deadline.Sub(info.StartTime)
+				require.GreaterOrEqual(t, delay, time.Duration(tc.wantMinMS)*time.Millisecond)
+				require.LessOrEqual(t, delay, time.Duration(tc.wantMaxMS)*time.Millisecond)
+
+				// A retry before the first event must honor the deadline already
+				// chosen for the public request, even if the settings changed.
+				time.Sleep(10 * time.Millisecond)
+				settings.ResponsesEarlyAckDelayMS = 1100
+				settings.ResponsesEarlyAckMaxDelayMS = 1200
+				helper.PrepareEarlyResponses(info, body)
+				require.NotNil(t, info.EarlyResponses)
+				require.NotNil(t, info.EarlyResponses.Pending())
+				assert.True(t, deadline.Equal(<-info.EarlyResponses.Pending()))
+			})
 		})
 	}
 }

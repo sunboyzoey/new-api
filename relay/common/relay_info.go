@@ -91,9 +91,10 @@ type RelayInfo struct {
 	StartTime         time.Time
 	FirstResponseTime time.Time
 	// Synthetic acknowledgments never overwrite upstream first-response timing.
-	EarlyResponses *EarlyResponsesState
-	EarlyAckReason string
-	FirstTextTime  time.Time
+	EarlyResponses   *EarlyResponsesState
+	EarlyAckReason   string
+	EarlyAckDeadline time.Time
+	FirstTextTime    time.Time
 	// ResponsesRetryManaged lets the router own final failure emission.
 	ResponsesRetryManaged bool
 	// ResponsesExternalTool marks an effective outbound tool that can change external state.

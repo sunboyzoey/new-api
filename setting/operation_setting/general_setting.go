@@ -20,6 +20,8 @@ type GeneralSetting struct {
 	// acceptance. Later failures are reported in the stream; this can be disabled.
 	ResponsesEarlyAckEnabled bool `json:"responses_early_ack_enabled"`
 	ResponsesEarlyAckDelayMS int  `json:"responses_early_ack_delay_ms"`
+	// A larger maximum selects a per-request delay in the inclusive range.
+	ResponsesEarlyAckMaxDelayMS int `json:"responses_early_ack_max_delay_ms"`
 	// 当前站点额度展示类型：USD / CNY / TOKENS
 	QuotaDisplayType string `json:"quota_display_type"`
 	// 自定义货币符号，用于 CUSTOM 展示类型

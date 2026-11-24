@@ -3,6 +3,7 @@ package helper
 import (
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -91,12 +92,18 @@ func PrepareEarlyResponses(info *relaycommon.RelayInfo, body common.ReplayableBo
 		return
 	}
 	info.EarlyAckReason = "eligible"
-	delay := settings.ResponsesEarlyAckDelayMS
-	if delay <= 0 {
-		delay = operation_setting.DefaultResponsesEarlyAckDelayMS
+	if info.EarlyAckDeadline.IsZero() {
+		delay := settings.ResponsesEarlyAckDelayMS
+		if delay <= 0 {
+			delay = operation_setting.DefaultResponsesEarlyAckDelayMS
+		}
+		delay = min(delay, 1500)
+		if upper := min(settings.ResponsesEarlyAckMaxDelayMS, 1500); upper > delay {
+			delay += rand.IntN(upper - delay + 1)
+		}
+		info.EarlyAckDeadline = info.StartTime.Add(time.Duration(delay) * time.Millisecond)
 	}
-	delay = min(delay, 1500)
-	remaining := time.Until(info.StartTime.Add(time.Duration(delay) * time.Millisecond))
+	remaining := time.Until(info.EarlyAckDeadline)
 	info.EarlyResponses = &relaycommon.EarlyResponsesState{
 		Timer: time.NewTimer(max(0, remaining)), ID: service.EarlyResponseIDPrefix + strings.ReplaceAll(uuid.NewString(), "-", ""),
 		CreatedAt: time.Now().Unix(), Chat: chat,
