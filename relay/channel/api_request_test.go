@@ -1,23 +1,193 @@
 package channel
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
+	openaisdk "github.com/openai/openai-go"
+	"github.com/openai/openai-go/option"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestKeepaliveClientCompatibility(t *testing.T) {
+	settings := operation_setting.GetGeneralSetting()
+	oldEnabled, oldSeconds := settings.PingIntervalEnabled, settings.PingIntervalSeconds
+	oldTimeout := constant.StreamingTimeout
+	settings.PingIntervalEnabled, settings.PingIntervalSeconds = true, 1
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() {
+		settings.PingIntervalEnabled, settings.PingIntervalSeconds = oldEnabled, oldSeconds
+		constant.StreamingTimeout = oldTimeout
+	})
+	service.InitHttpClient()
+	const chunk = "data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\ndata: [DONE]\n\n"
+	params := openaisdk.ChatCompletionNewParams{
+		Model:    "test-model",
+		Messages: []openaisdk.ChatCompletionMessageParamUnion{openaisdk.UserMessage("test")},
+	}
+	t.Run("heartbeat reaches client before model output without changing first response time", func(t *testing.T) {
+		release := make(chan struct{})
+		defer close(release)
+		observed := make(chan *relaycommon.RelayInfo, 1)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			c, _ := gin.CreateTestContext(w)
+			c.Request = r
+			reader, writer := io.Pipe()
+			defer reader.Close()
+			go func() {
+				defer writer.Close()
+				select {
+				case <-release:
+					_, _ = io.WriteString(writer, chunk)
+				case <-r.Context().Done():
+				}
+			}()
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+			helper.StreamScannerHandler(c, &http.Response{Body: reader}, info, func(data string, sr *helper.StreamResult) {})
+			observed <- info
+		}))
+		defer server.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+		require.NoError(t, err)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err, "headers must arrive before upstream releases any model data")
+		line, err := bufio.NewReader(resp.Body).ReadString('\n')
+		require.NoError(t, err)
+		assert.Equal(t, ": PING\n", line)
+		_ = resp.Body.Close()
+		cancel()
+		select {
+		case info := <-observed:
+			assert.True(t, info.FirstResponseTime.IsZero())
+			assert.Zero(t, info.ReceivedResponseCount)
+		case <-time.After(2 * time.Second):
+			t.Fatal("scanner did not stop after client disconnected")
+		}
+	})
+	for _, tc := range []struct {
+		name   string
+		stream bool
+		status int
+	}{
+		{"stream comments are ignored by SDK", true, 200},
+		{"nonstream JSON remains intact", false, 200},
+		{"delayed rate limit keeps HTTP 429", true, 429},
+		{"delayed gateway error keeps HTTP 502", true, 502},
+		{"nonstream rate limit keeps HTTP 429", false, 429},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.status != 200 {
+					// Exceed the configured heartbeat interval: pre-header
+					// heartbeats would commit 200 and corrupt SDK errors.
+					timer := time.NewTimer(1200 * time.Millisecond)
+					defer timer.Stop()
+					select {
+					case <-timer.C:
+					case <-r.Context().Done():
+						return
+					}
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if tc.stream && tc.status == 200 {
+					w.Header().Set("Content-Type", "text/event-stream")
+				}
+				w.WriteHeader(tc.status)
+				switch {
+				case tc.status != 200:
+					_, _ = io.WriteString(w, "{\"error\":{\"message\":\"test upstream failure\",\"type\":\"server_error\",\"code\":\"test_error\"}}")
+				case tc.stream:
+					_, _ = io.WriteString(w, chunk)
+				default:
+					_, _ = io.WriteString(w, "{\"id\":\"chatcmpl-test\",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}")
+				}
+			}))
+			defer upstream.Close()
+			gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				c, _ := gin.CreateTestContext(w)
+				c.Request = r
+				req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream.URL, strings.NewReader("{}"))
+				if err != nil {
+					http.Error(w, err.Error(), 500)
+					return
+				}
+				info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}, IsStream: tc.stream}
+				resp, err := doRequest(c, req, info)
+				if err != nil {
+					http.Error(w, err.Error(), 502)
+					return
+				}
+				defer resp.Body.Close()
+				if tc.stream && resp.StatusCode == 200 {
+					helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+						if err := helper.StringData(c, data); err != nil {
+							sr.Stop(err)
+						}
+					})
+					helper.Done(c)
+					return
+				}
+				w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+				w.WriteHeader(resp.StatusCode)
+				_, _ = io.Copy(w, resp.Body)
+			}))
+			defer gateway.Close()
+			client := openaisdk.NewClient(option.WithBaseURL(gateway.URL), option.WithAPIKey("local-test"), option.WithMaxRetries(0))
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var err error
+			if tc.stream {
+				stream := client.Chat.Completions.NewStreaming(ctx, params)
+				defer stream.Close()
+				var content strings.Builder
+				for stream.Next() {
+					for _, choice := range stream.Current().Choices {
+						content.WriteString(choice.Delta.Content)
+					}
+				}
+				err = stream.Err()
+				if tc.status == 200 {
+					assert.Equal(t, "hello", content.String())
+				}
+			} else {
+				result, resultErr := client.Chat.Completions.New(ctx, params)
+				err = resultErr
+				if tc.status == 200 {
+					require.NoError(t, err)
+					require.Len(t, result.Choices, 1)
+					assert.Equal(t, "hello", result.Choices[0].Message.Content)
+				}
+			}
+			if tc.status == 200 {
+				require.NoError(t, err)
+			} else {
+				var apiErr *openaisdk.Error
+				require.ErrorAs(t, err, &apiErr, "SDK must receive an HTTP error, not a successful empty stream")
+				assert.Equal(t, tc.status, apiErr.StatusCode)
+			}
+		})
+	}
+}
 
 func TestDoRequestRecordsTicketSummaryWithoutSecretOrStaleAttempt(t *testing.T) {
 	service.InitHttpClient()

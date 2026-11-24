@@ -162,10 +162,8 @@ func EffectiveSessionMode(setting *operation_setting.ChannelAffinitySetting, rul
 	return "prefer", "session_rule"
 }
 
-// RecordRequestPolicyTermination appends the final decision after routing has
-// stopped. It never writes a log row itself: the per-channel error log written
-// by ProcessChannelError already carries the decision record, so a second row
-// here would duplicate it.
+// RecordRequestPolicyTermination appends the decision used in the terminal
+// error log when routing stops before an attempt records its own stop decision.
 func RecordRequestPolicyTermination(c *gin.Context, apiErr *types.NewAPIError) {
 	if c == nil || apiErr == nil {
 		return

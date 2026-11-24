@@ -154,6 +154,48 @@ func TestExecuteTaskSubmissionRefundsWhenInsertFails(t *testing.T) {
 	assert.False(t, c.Writer.Written())
 }
 
+func TestTaskSubmissionWritesOnlyTheFinalChannelError(t *testing.T) {
+	for _, recovers := range []bool{true, false} {
+		t.Run(fmt.Sprintf("recovers_%t", recovers), func(t *testing.T) {
+			db, dialect := openTaskDialectDatabase(t, &model.Task{}, &model.Log{}, &model.User{})
+			oldDB, oldLogs := model.DB, model.LOG_DB
+			oldMain, oldLog := common.MainDatabaseType(), common.LogDatabaseType()
+			oldRedis, oldConsume := common.RedisEnabled, common.LogConsumeEnabled
+			oldEnabled, oldRetries := constant.ErrorLogEnabled, common.RetryTimes
+			model.DB, model.LOG_DB = db, db
+			common.SetDatabaseTypes(dialect, dialect)
+			common.RedisEnabled, common.LogConsumeEnabled = false, false
+			constant.ErrorLogEnabled, common.RetryTimes = true, 1
+			t.Cleanup(func() {
+				model.DB, model.LOG_DB = oldDB, oldLogs
+				common.SetDatabaseTypes(oldMain, oldLog)
+				common.RedisEnabled, common.LogConsumeEnabled = oldRedis, oldConsume
+				constant.ErrorLogEnabled, common.RetryTimes = oldEnabled, oldRetries
+			})
+			c := taskSubmissionTestContext()
+			var events []string
+			info := taskSubmissionRelayInfo(&taskSubmissionTestBilling{events: &events})
+			attempts := 0
+			_, taskErr := executeTaskSubmissionWith(c, info, func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+				attempts++
+				if recovers && attempts == 2 {
+					return &relay.TaskSubmitResult{Platform: "plugin", UpstreamTaskID: "accepted"}, nil
+				}
+				return nil, &dto.TaskError{Message: "upstream unavailable", StatusCode: http.StatusBadGateway}
+			})
+			require.Equal(t, 2, attempts)
+			assert.Equal(t, recovers, taskErr == nil)
+			var errors int64
+			require.NoError(t, db.Model(&model.Log{}).Where("type = ?", model.LogTypeError).Count(&errors).Error)
+			if recovers {
+				assert.Zero(t, errors)
+			} else {
+				assert.EqualValues(t, 1, errors)
+			}
+		})
+	}
+}
+
 func TestExecuteTaskSubmissionSettlementFailureStaysDurableAndWritesNothing(t *testing.T) {
 	events := make([]string, 0, 3)
 	database := setupTaskSubmissionDatabase(t, true, &events)

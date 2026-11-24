@@ -2,9 +2,11 @@ package openai
 
 import (
 	"fmt"
+	"github.com/tidwall/gjson"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -25,7 +27,15 @@ func sendStreamData(c *gin.Context, info *relaycommon.RelayInfo, data string, fo
 		return nil
 	}
 
+	var err error
+	data, err = helper.RewriteEarlyChatChunk(info, data)
+	if err != nil {
+		return err
+	}
 	if !forceFormat && !thinkToContent {
+		if info.EarlyResponses != nil && info.EarlyResponses.Chat {
+			return helper.ResponseChunkData(c, dto.ResponsesStreamResponse{}, data)
+		}
 		return helper.StringData(c, data)
 	}
 
@@ -121,15 +131,46 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	var secondLastStreamData string // 保留倒数第二个stream data；部分兼容网关把完整usage放在倒数第二个事件
 	seenStreamToolCalls := make(map[string]struct{})
 	var streamFunctionCallNames []string
+	earlyChat := info.EarlyResponses != nil && info.EarlyResponses.Chat
+	strictChat := info.RelayFormat == types.RelayFormatOpenAI
+	var streamErr *types.NewAPIError
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
-		if lastStreamData != "" {
+		if !earlyChat && lastStreamData != "" {
 			if err := HandleStreamFormat(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent); err != nil {
 				common.SysLog("error handling stream format: " + err.Error())
-				sr.Error(err)
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
+				sr.Stop(err)
+				return
 			}
 		}
 		if len(data) > 0 {
+			if strictChat {
+				if !gjson.Valid(data) {
+					streamErr = types.NewOpenAIError(fmt.Errorf("invalid upstream chat stream JSON"), types.ErrorCodeBadResponse, http.StatusBadGateway)
+					sr.Stop(streamErr)
+					return
+				}
+				if upstreamError := gjson.Get(data, "error"); upstreamError.Exists() && upstreamError.Type != gjson.Null {
+					// Retain authoritative usage even when attached to an error.
+					secondLastStreamData, lastStreamData = lastStreamData, data
+					wire := types.OpenAIError{}
+					_ = common.UnmarshalJsonStr(upstreamError.Raw, &wire)
+					if wire.Code == nil && wire.Type == "" {
+						wire.Code, wire.Type = "server_error", "server_error"
+					}
+					if wire.Message == "" {
+						wire.Message = "upstream chat stream failed"
+					}
+					status := int(gjson.Get(data, "status_code").Int())
+					if status < 400 || status > 599 {
+						status = http.StatusBadRequest
+					}
+					streamErr = service.NormalizeResponsesRetryError(types.WithOpenAIError(wire, status))
+					sr.Stop(streamErr)
+					return
+				}
+			}
 			if lastStreamData != "" {
 				secondLastStreamData = lastStreamData
 			}
@@ -138,7 +179,20 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 			observeStreamChoices(info, data, seenStreamToolCalls, &streamFunctionCallNames)
 			if err := processTokenData(info, data, &responseTextBuilder, &toolCount); err != nil {
 				logger.LogError(c, "error processing stream token data: "+err.Error())
+				if strictChat {
+					streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusBadGateway)
+					sr.Stop(streamErr)
+					return
+				}
 				sr.Error(err)
+			}
+			// Do not hold the first role/content event for a later frame. Usage
+			// snapshots are still retained above for settlement after the stream.
+			if earlyChat && (info.ShouldIncludeUsage || len(gjson.Get(data, "choices").Array()) > 0) {
+				if err := HandleStreamFormat(c, info, data, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent); err != nil {
+					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
+					sr.Stop(err)
+				}
 			}
 		}
 	})
@@ -175,12 +229,6 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		}
 	}
 
-	if info.RelayFormat == types.RelayFormatOpenAI {
-		if shouldSendLastResp {
-			_ = sendStreamData(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
-		}
-	}
-
 	if !containStreamUsage {
 		usage = service.ResponseText2Usage(c, responseTextBuilder.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
 		usage.CompletionTokens += toolCount * 7
@@ -190,6 +238,47 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 
 	for _, name := range streamFunctionCallNames {
 		info.CountBillableToolCall(dto.BuildInCallFunctionCall, name)
+	}
+
+	if strictChat && streamErr == nil && shouldSendLastResp && !earlyChat && lastStreamData != "" {
+		if err := sendStreamData(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent); err != nil {
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
+			return usage, nil
+		}
+	}
+
+	if strictChat {
+		if c.Request.Context().Err() != nil || info.StreamStatus.EndReason == relaycommon.StreamEndReasonClientGone || info.StreamStatus.EndReason == relaycommon.StreamEndReasonPingFail {
+			return usage, nil
+		}
+		if streamErr == nil && (!info.StreamStatus.IsNormalEnd() || info.StreamStatus.HasErrors() || info.StreamStatus.ResponseOutcome() != "completed") {
+			streamErr = types.WithOpenAIError(types.OpenAIError{Code: "server_error", Type: "server_error", Message: "upstream chat stream failed or ended before a finish reason"}, http.StatusBadGateway)
+		}
+		if streamErr != nil {
+			streamErr = service.NormalizeResponsesRetryError(streamErr)
+			info.StreamStatus.MarkFailed(string(streamErr.GetErrorCode()), streamErr.ToOpenAIError().Type, streamErr.StatusCode)
+			if !containStreamUsage && responseTextBuilder.Len() == 0 && toolCount == 0 {
+				usage = &dto.Usage{}
+			}
+			// Return uncommitted empty failures to the Router. Otherwise settle
+			// observed usage once and signal failure without a synthetic [DONE].
+			if !c.Writer.Written() && usage.TotalTokens == 0 {
+				return nil, streamErr
+			}
+			_ = helper.FailChatStream(c, info, streamErr)
+			if usage.TotalTokens == 0 && responseTextBuilder.Len() == 0 && toolCount == 0 {
+				types.ErrOptionWithSkipRetry()(streamErr)
+				return nil, streamErr
+			}
+			return usage, nil
+		}
+	}
+	if earlyChat {
+		state := info.EarlyResponses
+		if !state.SentAt.IsZero() {
+			responseId, createAt = state.ID, state.CreatedAt
+		}
+		state.Finished = true
 	}
 
 	HandleFinalResponse(c, info, lastStreamData, responseId, createAt, model, systemFingerprint, usage, containStreamUsage)
@@ -205,6 +294,9 @@ func observeStreamChoices(info *relaycommon.RelayInfo, data string, seen map[str
 		return
 	}
 	for _, choice := range streamResponse.Choices {
+		if info.FirstTextTime.IsZero() && choice.Delta.GetContentString() != "" {
+			info.FirstTextTime = time.Now()
+		}
 		if choice.FinishReason != nil && *choice.FinishReason != "" {
 			if *choice.FinishReason == constant.FinishReasonContentFilter {
 				info.PerformanceBusinessRejection = true

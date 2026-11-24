@@ -150,6 +150,17 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	copyCodexSSEHeaders(c, resp)
 	SetEventStreamHeaders(c)
 
+	// The adaptor has accepted the upstream response. Flush a comment before
+	// waiting for its first event; comments are not model output and must not
+	// advance SetFirstResponseTime or ReceivedResponseCount.
+	if pingEnabled && (!info.ResponsesRetryManaged || c.Writer.Written()) {
+		ExtendWriteDeadline(c)
+		if err := PingData(c); err != nil {
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonPingFail, err)
+			return
+		}
+	}
+
 	ctx = context.WithValue(ctx, "stop_chan", stopChan)
 
 	// Handle ping data sending with improved error handling
@@ -178,6 +189,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 					func() {
 						writeMutex.Lock()
 						defer writeMutex.Unlock()
+						if info.ResponsesRetryManaged && !c.Writer.Written() {
+							return
+						}
 						ExtendWriteDeadline(c)
 						err = PingData(c)
 					}()
@@ -201,6 +215,8 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			}
 		})
 	}
+
+	earlyAck := info.EarlyResponses.Pending()
 
 	dataChan := make(chan string, 10)
 
@@ -295,16 +311,36 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonEOF, nil)
 	})
 
-	// 主循环等待完成或超时
-	select {
-	case <-ticker.C:
-		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
-	case <-stopChan:
-		// EndReason already set by the goroutine that triggered stopChan
-	case <-c.Request.Context().Done():
-		// 客户端断开：立即 cleanup 关闭上游 resp.Body，解除 scanner 阻塞并让上游停止生成，
-		// 避免为已放弃的请求继续消费上游 token。
-		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
+	// All downstream writes, including early acknowledgments, share this lock.
+waitStream:
+	for {
+		select {
+		case <-earlyAck:
+			earlyAck = nil
+			writeMutex.Lock()
+			var err error
+			select {
+			case <-stopChan:
+				// A known failure or terminal wins over an expired ack timer.
+			default:
+				err = SendEarlyResponsesAck(c, info)
+			}
+			writeMutex.Unlock()
+			if err != nil {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
+				break waitStream
+			}
+		case <-ticker.C:
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
+			break waitStream
+		case <-stopChan:
+			break waitStream
+		case <-c.Request.Context().Done():
+			writeMutex.Lock()
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
+			writeMutex.Unlock()
+			break waitStream
+		}
 	}
 
 	cleanup()

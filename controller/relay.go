@@ -72,8 +72,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	//originalModel := common.GetContextKeyString(c, constant.ContextKeyOriginalModel)
 
 	var (
-		newAPIError *types.NewAPIError
-		ws          *websocket.Conn
+		newAPIError        *types.NewAPIError
+		relayInfo          *relaycommon.RelayInfo
+		attemptedChannelID int
+		ws                 *websocket.Conn
 	)
 
 	if relayFormat == types.RelayFormatOpenAIRealtime {
@@ -89,8 +91,14 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	defer func() {
 		if newAPIError != nil {
 			service.RecordRequestPolicyTermination(c, newAPIError)
+			if attemptedChannelID != 0 {
+				service.RecordRelayErrorLog(c, attemptedChannelID, newAPIError, relayInfo)
+			}
 			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
+			if c.GetBool("responses_stream_error_sent") || c.GetBool("chat_stream_error_sent") || c.GetBool("responses_early_ack_committed") || (c.GetBool("responses_retry_managed") && c.Writer.Written()) {
+				return
+			}
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
 				helper.WssError(c, ws, newAPIError.ToOpenAIError())
@@ -100,6 +108,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 					"error": newAPIError.ToClaudeError(),
 				})
 			default:
+				c.Writer.Header().Set("Content-Type", "application/json")
 				c.JSON(newAPIError.StatusCode, gin.H{
 					"error": newAPIError.ToOpenAIError(),
 				})
@@ -118,10 +127,22 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		return
 	}
 
-	relayInfo, err := relaycommon.GenRelayInfo(c, relayFormat, request, ws)
+	relayInfo, err = relaycommon.GenRelayInfo(c, relayFormat, request, ws)
 	if err != nil {
 		newAPIError = types.NewError(err, types.ErrorCodeGenRelayInfoFailed)
 		return
+	}
+
+	// Only native Responses uses the content-aware retry gate. Other protocols
+	// retain their existing forwarding and retry behavior.
+	relayInfo.ResponsesRetryManaged = relayFormat == types.RelayFormatOpenAIResponses && relayInfo.IsStream && relayInfo.RelayMode == relayconstant.RelayModeResponses
+	if relayInfo.ResponsesRetryManaged {
+		c.Set("responses_retry_managed", true)
+		defer func() {
+			if newAPIError != nil && c.Writer.Written() {
+				_ = helper.FailEarlyResponses(c, relayInfo, newAPIError)
+			}
+		}()
 	}
 
 	defer func() {
@@ -156,6 +177,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	relayInfo.LastError = nil
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
+		if common.GetContextKeyBool(c, constant.ContextKeyResponsesChannelFailover) && relayInfo.LastError != nil && c.Request.Context().Err() != nil {
+			newAPIError = relayInfo.LastError
+			break
+		}
 		relayInfo.StreamStatus = nil
 		relayInfo.PerformanceBusinessRejection = false
 		relayInfo.PerformanceOutputTokens = 0
@@ -164,6 +189,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
 			newAPIError = channelErr
+			if (relayInfo.ResponsesRetryManaged || common.GetContextKeyBool(c, constant.ContextKeyResponsesChannelFailover)) && relayInfo.LastError != nil {
+				newAPIError = relayInfo.LastError
+			}
 			break
 		}
 		service.AppendUsedChannel(c, channel.Id)
@@ -184,6 +212,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
 
+		attemptedChannelID = channel.Id
 		switch relayFormat {
 		case types.RelayFormatOpenAIRealtime:
 			newAPIError = relay.WssHelper(c, relayInfo)
@@ -197,6 +226,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		if newAPIError == nil {
 			service.MarkRequestPolicySuccess(c, relayInfo.StreamStatus)
+			// A committed stream can carry its terminal failure in-band.
+			if streamErr := service.FinalRelayStreamError(relayInfo.StreamStatus); streamErr != nil {
+				service.RecordRelayErrorLog(c, channel.Id, streamErr, relayInfo)
+			}
 			relayInfo.LastError = nil
 			return
 		}
@@ -204,9 +237,15 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		relayInfo.LastError = newAPIError
 
-		decision := service.DecideRelayRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry())
+		remaining := common.RetryTimes - retryParam.GetRetry()
+		if common.GetContextKeyBool(c, constant.ContextKeyResponsesChannelFailover) {
+			// Auto-group selection may have reset the legacy priority index
+			// before this request reached its first native CPA channel.
+			remaining = min(remaining, common.RetryTimes+1-len(c.GetStringSlice("use_channel")))
+		}
+		decision := service.DecideRelayRetry(c, newAPIError, remaining)
 		service.RecordPolicyFailure(c, channel.Id, newAPIError, decision)
-		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, relayInfo)
+		service.ProcessChannelAttemptError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
 
 		if decision.Action != "retry" {
 			break
@@ -473,18 +512,23 @@ func executeTaskSubmissionWith(
 	c *gin.Context,
 	relayInfo *relaycommon.RelayInfo,
 	submit taskSubmitAttempt,
-) (*taskSubmissionOutcome, *taskdto.TaskError) {
+) (outcome *taskSubmissionOutcome, taskErr *taskdto.TaskError) {
 	policy := service.RequestPolicy(c)
 	diagnostics := newTaskPluginSubmitDiagnostics(c)
 	diagnostics.start(relayInfo)
 	var result *relay.TaskSubmitResult
-	var taskErr *taskdto.TaskError
+	var lastChannelID int
 	durable := false
 	stage := "start"
 	defer func() {
 		if !durable && relayInfo.Billing != nil {
 			diagnostics.refund(stage)
 			relayInfo.Billing.Refund(c)
+		}
+		if taskErr != nil && lastChannelID != 0 && (!taskErr.LocalError || relayInfo.LastError != nil) {
+			finalErr := taskSubmissionAPIError(taskErr)
+			service.RecordRequestPolicyTermination(c, finalErr)
+			service.RecordRelayErrorLog(c, lastChannelID, finalErr, relayInfo)
 		}
 	}()
 	stage = "before_attempt"
@@ -544,6 +588,7 @@ func executeTaskSubmissionWith(
 		c.Request.Body = io.NopCloser(bodyStorage)
 
 		stage = "submit"
+		lastChannelID = channel.Id
 		result, taskErr = submit(c, relayInfo)
 		if requestErr := c.Request.Context().Err(); requestErr != nil {
 			diagnostics.cancelled("after_submit", retryParam.GetRetry()+1)
@@ -560,11 +605,10 @@ func executeTaskSubmissionWith(
 		decision := decideTaskRetry(c, taskErr, common.RetryTimes-retryParam.GetRetry())
 		service.RecordPolicyFailure(c, channel.Id, taskAPIError, decision)
 		if !taskErr.LocalError {
-			processChannelError(c,
+			service.ProcessChannelAttemptError(c,
 				*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
 					common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()),
-				taskAPIError,
-				relayInfo)
+				taskAPIError)
 		}
 
 		willRetry := decision.Action == "retry"
@@ -700,6 +744,7 @@ func executeTaskSubmissionWith(
 		service.MarkRequestPolicySuccess(c, nil)
 	} else {
 		policy.AddEvent(service.PolicyEvent{Decision: service.PolicyDecision{Action: "stop", Reason: "task_failed", Source: "upstream"}})
+		service.RecordRelayErrorLog(c, lastChannelID, types.WithOpenAIError(types.OpenAIError{Code: "task_failed", Message: "The upstream task failed."}, http.StatusBadGateway), relayInfo)
 	}
 	service.LogTaskConsumption(c, relayInfo, task)
 	diagnostics.complete(task, result.Quota)

@@ -14,11 +14,83 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/model_setting"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestResponsesContinuationSelectsOwnerOverPromptAffinity(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	setupOriginTaskDB(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Ability{}))
+	oldCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	setting := operation_setting.GetChannelAffinitySetting()
+	oldSetting := *setting
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = oldCache
+		*setting = oldSetting
+	})
+	setting.Enabled = true
+	setting.SwitchOnSuccess = false
+	setting.Rules = []operation_setting.ChannelAffinityRule{{
+		Name: "owner test", ModelRegex: []string{"^gpt-owner-test$"}, KeySources: []operation_setting.ChannelAffinityKeySource{{Type: "gjson", Path: "prompt_cache_key"}},
+		SkipRetryOnFailure: true, IncludeUsingGroup: true, IncludeRuleName: true,
+	}}
+	const group = "owner-test-group"
+	for _, id := range []int{143, 142} {
+		channel := model.Channel{Id: id, Status: common.ChannelStatusEnabled, Name: fmt.Sprint(id), Type: constant.ChannelTypeOpenAI,
+			Key: "test", Group: group, Models: "gpt-owner-test", Priority: common.GetPointer(int64(id))}
+		require.NoError(t, model.DB.Create(&channel).Error)
+		require.NoError(t, model.DB.Create(&model.Ability{ChannelId: id, Group: group, Model: channel.Models, Enabled: true}).Error)
+	}
+	model.InitChannelCache()
+
+	request := func(userID int, usingGroup string, previous string) *gin.Context {
+		body := fmt.Sprintf(`{"model":"gpt-owner-test","prompt_cache_key":"shared-session","previous_response_id":%q}`, previous)
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+		c.Request.Header.Set("Content-Type", "application/json")
+		common.SetContextKey(c, constant.ContextKeyUserId, userID)
+		common.SetContextKey(c, constant.ContextKeyUsingGroup, usingGroup)
+		Distribute()(c)
+		return c
+	}
+	first := request(5, group, "")
+	require.False(t, first.IsAborted())
+	require.Equal(t, 143, common.GetContextKeyInt(first, constant.ContextKeyChannelId))
+
+	const alias = service.EarlyResponseIDPrefix + "owner_test"
+	require.NoError(t, service.SaveEarlyResponseAlias(5, 142, alias, "resp_actual"))
+	require.NoError(t, service.SaveFallbackResponseOwner(first, 142, alias+"_unbound", "resp_actual"))
+	unbound, err := service.PreviousResponseOwnerChannel(5, alias+"_unbound")
+	require.NoError(t, err)
+	assert.Zero(t, unbound, "ordinary acknowledgments keep their existing selection")
+	common.SetContextKey(first, constant.ContextKeyResponsesChannelFailover, true)
+	first.Set("use_channel", []string{"143", "142"})
+	require.NoError(t, service.SaveFallbackResponseOwner(first, 142, alias, "resp_actual"))
+	follow := request(5, group, alias)
+	require.False(t, follow.IsAborted())
+	assert.Equal(t, 142, common.GetContextKeyInt(follow, constant.ContextKeyChannelId))
+	assert.Equal(t, 142, common.GetContextKeyInt(follow, constant.ContextKeyResponsesOwnerChannel))
+	assert.True(t, request(5, "unauthorized-group", alias).IsAborted())
+	anotherUser := request(6, group, alias)
+	assert.Zero(t, common.GetContextKeyInt(anotherUser, constant.ContextKeyResponsesOwnerChannel))
+	_, err = service.ResolveEarlyResponseAlias(6, 143, alias)
+	assert.Error(t, err)
+
+	service.RecordFallbackResponseOwner(first, 142, "raw-fallback-test")
+	rawFollow := request(5, group, "raw-fallback-test")
+	require.False(t, rawFollow.IsAborted())
+	assert.Equal(t, 142, common.GetContextKeyInt(rawFollow, constant.ContextKeyChannelId))
+	service.RecordFallbackResponseOwner(rawFollow, 142, "raw-second-turn")
+	assert.Equal(t, 142, common.GetContextKeyInt(request(5, group, "raw-second-turn"), constant.ContextKeyChannelId))
+	// A continuation did not replace the original shared prompt-cache preference.
+	assert.Equal(t, 143, common.GetContextKeyInt(request(5, group, ""), constant.ContextKeyChannelId))
+}
 
 func TestChannelMatchesExpectedTaskPluginUsesGenericChannelSetting(t *testing.T) {
 	channel := &model.Channel{Type: constant.ChannelTypeTaskPlugin}

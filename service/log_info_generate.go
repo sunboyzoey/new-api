@@ -72,7 +72,20 @@ func AppendRelayLogAdminInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo,
 		return
 	}
 	other.SetAdmin("use_channel", ctx.GetStringSlice("use_channel"))
+	if commit, ok := ctx.Get(responsesStreamCommitKey); ok {
+		other.SetAdmin("responses_stream_commit", commit)
+	}
 	if relayInfo != nil {
+		if relayInfo.EarlyAckReason != "" {
+			other.SetAdmin("early_ack_reason", relayInfo.EarlyAckReason)
+		}
+		if state := relayInfo.EarlyResponses; state != nil && !state.SentAt.IsZero() {
+			other.SetPublic("early_ack_ms", state.SentAt.Sub(relayInfo.StartTime).Milliseconds())
+			other.SetPublic("early_ack", true)
+		}
+		if !relayInfo.FirstTextTime.IsZero() {
+			other.SetPublic("first_text_ms", relayInfo.FirstTextTime.Sub(relayInfo.StartTime).Milliseconds())
+		}
 		if relayInfo.CodexTicket != nil {
 			other.SetAdmin("codex_ticket", *relayInfo.CodexTicket)
 		}

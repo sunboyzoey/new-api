@@ -2,12 +2,16 @@ package openai
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -15,11 +19,136 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// responsesDeliveryWriter models delivery failures and a client closing the
+// connection immediately after receiving a flushed frame.
+type responsesDeliveryWriter struct {
+	*httptest.ResponseRecorder
+	writeErr   error
+	flushErr   error
+	shortWrite bool
+	afterFlush context.CancelFunc
+}
+
+func (w *responsesDeliveryWriter) Write(p []byte) (int, error) {
+	if w.writeErr != nil {
+		return 0, w.writeErr
+	}
+	if w.shortWrite {
+		return len(p) - 1, nil
+	}
+	return w.ResponseRecorder.Write(p)
+}
+
+func (w *responsesDeliveryWriter) FlushError() error {
+	if w.flushErr != nil {
+		return w.flushErr
+	}
+	w.ResponseRecorder.Flush()
+	if w.afterFlush != nil {
+		w.afterFlush()
+		// Give the scanner's cancellation branch a chance to run before the
+		// handler marks the terminal event done, without timing-based sleeps.
+		runtime.Gosched()
+	}
+	return nil
+}
+
+func TestOaiResponsesStreamTerminalDelivery(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	deliveryErr := errors.New("downstream write failed")
+	for _, tc := range []struct {
+		name             string
+		event            string
+		outcome          string
+		cancelAfterFlush bool
+		writeErr         error
+		flushErr         error
+		shortWrite       bool
+		wantGone         bool
+	}{
+		{name: "completed without EOF", event: "response.completed", outcome: "completed"},
+		{name: "done alias without EOF", event: "response.done", outcome: "completed"},
+		{name: "client closes after completion", event: "response.completed", outcome: "completed", cancelAfterFlush: true},
+		{name: "upstream failure remains failed", event: "response.failed", outcome: "failed", cancelAfterFlush: true},
+		{name: "incomplete remains incomplete", event: "response.incomplete", outcome: "incomplete"},
+		{name: "cancelled remains cancelled", event: "response.cancelled", outcome: "cancelled"},
+		{name: "error envelope remains failed", event: "error", outcome: "failed"},
+		{name: "disconnect before terminal", event: "response.output_text.delta", cancelAfterFlush: true, wantGone: true},
+		{name: "terminal write failure", event: "response.completed", outcome: "completed", writeErr: deliveryErr, wantGone: true},
+		{name: "terminal short write", event: "response.completed", outcome: "completed", shortWrite: true, wantGone: true},
+		{name: "terminal flush failure", event: "response.completed", outcome: "completed", flushErr: deliveryErr, wantGone: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			writer := &responsesDeliveryWriter{ResponseRecorder: httptest.NewRecorder(), writeErr: tc.writeErr, flushErr: tc.flushErr, shortWrite: tc.shortWrite}
+			if tc.cancelAfterFlush {
+				writer.afterFlush = cancel
+			}
+			c, _ := gin.CreateTestContext(writer)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(ctx)
+			payload, err := common.Marshal(map[string]any{
+				"type":     tc.event,
+				"response": map[string]any{"usage": map[string]any{"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}},
+			})
+			require.NoError(t, err)
+			body := &blockingBody{chunk: []byte("data: " + string(payload) + "\n\n"), closed: make(chan struct{})}
+			defer body.Close()
+			info := &relaycommon.RelayInfo{OriginModelName: "gpt-6-astra", DisablePing: true, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-6-astra"}}
+			resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: body}
+			var usage *dto.Usage
+			var apiErr *types.NewAPIError
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				usage, apiErr = OaiResponsesStreamHandler(c, info, resp)
+			}()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				cancel()
+				_ = body.Close()
+				<-done
+				t.Fatal("handler waited for upstream EOF after terminal delivery")
+			}
+			require.Nil(t, apiErr)
+			require.NotNil(t, usage)
+			assert.Equal(t, tc.outcome, info.StreamStatus.ResponseOutcome())
+			wantReason := relaycommon.StreamEndReasonDone
+			if tc.wantGone {
+				wantReason = relaycommon.StreamEndReasonClientGone
+			}
+			assert.Equal(t, wantReason, info.StreamStatus.EndReason)
+			service.MarkRequestPolicySuccess(c, info.StreamStatus)
+			assert.Equal(t, !tc.wantGone && tc.outcome == "completed", service.RequestPolicy(c).Successful,
+				"only a successfully delivered completion is a successful request")
+			if tc.writeErr != nil || tc.flushErr != nil || tc.shortWrite {
+				assert.True(t, info.StreamStatus.HasErrors())
+			}
+			if tc.outcome == "completed" {
+				assert.Equal(t, 7, usage.PromptTokens, "keep upstream usage even if delivery fails")
+				assert.Equal(t, 3, usage.CompletionTokens)
+			}
+			if !tc.wantGone {
+				assert.Equal(t, "event: "+tc.event+"\ndata: "+string(payload)+"\n\n", writer.Body.String())
+			}
+			select {
+			case <-body.closed:
+			default:
+				t.Error("upstream body was not closed")
+			}
+		})
+	}
+}
 
 func TestOaiResponsesHandlerCountsOutputCallsNotDeclarations(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -449,6 +578,52 @@ func TestAzureHostedWebSearch(t *testing.T) {
 				}
 			}
 			assert.Equal(t, map[string]int{"bing_web_search": 5}, billed)
+		})
+	}
+}
+
+func TestManagedResponsesTerminalDisconnect(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	for _, tc := range []struct {
+		name, event, outcome string
+		flushError           bool
+		wantError            bool
+	}{
+		{"completed then disconnect", "response.completed", "completed", false, false},
+		{"done then disconnect", "response.done", "completed", false, false},
+		{"incomplete then disconnect", "response.incomplete", "incomplete", false, false},
+		{"cancelled then disconnect", "response.cancelled", "cancelled", false, false},
+		{"disconnect before terminal", "response.output_text.delta", "failed", false, true},
+		{"terminal flush fails", "response.completed", "failed", true, true},
+		{"upstream failure", "response.failed", "failed", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			writer := &responsesDeliveryWriter{ResponseRecorder: httptest.NewRecorder(), afterFlush: cancel}
+			if tc.flushError {
+				writer.flushErr = errors.New("downstream flush failed")
+			}
+			c, _ := gin.CreateTestContext(writer)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(ctx)
+			info := &relaycommon.RelayInfo{ResponsesRetryManaged: true, DisablePing: true, ChannelMeta: &relaycommon.ChannelMeta{}}
+			payload, err := common.Marshal(map[string]any{"type": tc.event, "delta": "hello", "response": map[string]any{"usage": map[string]any{"input_tokens": 7, "output_tokens": 3}}})
+			require.NoError(t, err)
+			usage, apiErr := OaiResponsesStreamHandler(c, info, &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("data: " + string(payload) + "\n\n"))})
+			if tc.wantError {
+				require.NotNil(t, apiErr)
+			} else {
+				require.Nil(t, apiErr)
+				assert.ErrorIs(t, ctx.Err(), context.Canceled)
+				assert.Equal(t, "event: "+tc.event+"\ndata: "+string(payload)+"\n\n", writer.Body.String())
+			}
+			require.NotNil(t, usage)
+			if tc.event != "response.output_text.delta" {
+				assert.Equal(t, 10, usage.TotalTokens)
+			}
+			assert.Equal(t, tc.outcome, info.StreamStatus.ResponseOutcome())
 		})
 	}
 }

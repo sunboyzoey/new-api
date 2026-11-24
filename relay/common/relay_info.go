@@ -90,7 +90,14 @@ type RelayInfo struct {
 	TokenUnlimited    bool
 	StartTime         time.Time
 	FirstResponseTime time.Time
-	isFirstResponse   bool
+	// Synthetic acknowledgments never overwrite upstream first-response timing.
+	EarlyResponses *EarlyResponsesState
+	EarlyAckReason string
+	FirstTextTime  time.Time
+	// ResponsesRetryManaged lets the router own final failure emission.
+	ResponsesRetryManaged bool
+	ResponsePreviousAlias string
+	isFirstResponse       bool
 	//SendLastReasoningResponse bool
 	IsStream               bool
 	IsGeminiBatchEmbedding bool

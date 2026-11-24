@@ -24,6 +24,19 @@ import (
 
 func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
 	info.InitChannelMeta(c)
+	info.EarlyResponses.Stop()
+	info.EarlyResponses = nil
+	upstreamStarted := false
+	defer func() {
+		info.EarlyResponses.Stop()
+		if newAPIError != nil && upstreamStarted && info.IsStream && info.RelayFormat == types.RelayFormatOpenAI {
+			newAPIError = service.NormalizeResponsesRetryError(newAPIError)
+			if c.Writer.Written() {
+				types.ErrOptionWithSkipRetry()(newAPIError)
+				_ = helper.FailChatStream(c, info, newAPIError)
+			}
+		}
+	}()
 
 	textReq, ok := info.Request.(*dto.GeneralOpenAIRequest)
 	if !ok {
@@ -79,6 +92,7 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		!info.ChannelSetting.PassThroughBodyEnabled &&
 		service.ShouldChatCompletionsUseResponsesGlobal(info.ChannelId, info.ChannelType, info.OriginModelName) {
 		applySystemPromptIfNeeded(c, info, request)
+		upstreamStarted = true
 		usage, newApiErr := textRequestViaResponses(c, info, adaptor, request)
 		if newApiErr != nil {
 			return newApiErr
@@ -149,7 +163,11 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		requestBody = body
 	}
 
+	if body, ok := requestBody.(common.ReplayableBody); ok {
+		helper.PrepareEarlyResponses(info, body)
+	}
 	var httpResp *http.Response
+	upstreamStarted = true
 	resp, err := adaptor.DoRequest(c, info, requestBody)
 	if err != nil {
 		return types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
@@ -168,6 +186,12 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		}
 	}
 
+	if info.EarlyResponses != nil && (httpResp == nil || !strings.HasPrefix(strings.ToLower(httpResp.Header.Get("Content-Type")), "text/event-stream")) {
+		if httpResp != nil {
+			service.CloseResponseBodyGracefully(httpResp)
+		}
+		return types.NewOpenAIError(fmt.Errorf("expected upstream chat event stream"), types.ErrorCodeBadResponse, http.StatusBadGateway)
+	}
 	usage, newApiErr := adaptor.DoResponse(c, httpResp, info)
 	if newApiErr != nil {
 		// reset status code 重置状态码

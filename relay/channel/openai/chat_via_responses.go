@@ -18,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 func OaiResponsesToChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
@@ -187,6 +188,7 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
 	}
 	streamErr := (*types.NewAPIError)(nil)
+	strictChat := info.RelayFormat == types.RelayFormatOpenAI
 	// upstreamFailed records a response.failed / response.error event and
 	// failedUsage the usage it reported, if any.
 	upstreamFailed := false
@@ -200,7 +202,7 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 	// went away the upstream already produced output, so the request settles
 	// normally instead of failing; any other write error stays a server error.
 	writeFailed := func(err error) bool {
-		if c.Request.Context().Err() != nil {
+		if strictChat || c.Request.Context().Err() != nil {
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
 			return false
 		}
@@ -223,6 +225,35 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 	}
 
 	sendStreamResult := func(result relayconvert.ResponseResult) bool {
+		// Converted chat chunks share the same acknowledgment identity.
+		if info.EarlyResponses != nil && info.EarlyResponses.Chat {
+			var chunk *dto.ChatCompletionsStreamResponse
+			switch value := result.Value.(type) {
+			case dto.ChatCompletionsStreamResponse:
+				chunk = &value
+			case *dto.ChatCompletionsStreamResponse:
+				chunk = value
+			}
+			if chunk != nil {
+				if len(chunk.Choices) == 0 && chunk.Usage == nil {
+					return true
+				}
+				raw, err := common.Marshal(chunk)
+				if err != nil {
+					streamErr = types.NewOpenAIError(err, types.ErrorCodeJsonMarshalFailed, http.StatusBadGateway)
+					return false
+				}
+				data, err := helper.RewriteEarlyChatChunk(info, string(raw))
+				if err != nil {
+					streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusBadGateway)
+					return false
+				}
+				if err := helper.ResponseChunkData(c, dto.ResponsesStreamResponse{}, data); err != nil {
+					return writeFailed(err)
+				}
+				return true
+			}
+		}
 		switch value := result.Value.(type) {
 		case dto.ChatCompletionsStreamResponse:
 			if len(value.Choices) == 0 && value.Usage == nil {
@@ -272,6 +303,11 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		var streamResp dto.ResponsesStreamResponse
 		if err := common.UnmarshalJsonStr(data, &streamResp); err != nil {
 			logger.LogError(c, "failed to unmarshal responses stream event: "+err.Error())
+			if strictChat {
+				streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusBadGateway)
+				sr.Stop(streamErr)
+				return
+			}
 			sr.Error(err)
 			return
 		}
@@ -279,8 +315,43 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		if streamResp.Response != nil {
 			info.ObserveResponseModel(streamResp.Response.Model)
 		}
-		if streamResp.Type == "response.error" || streamResp.Type == "response.failed" {
+		service.ObserveResponsesOutcome(info, &streamResp)
+		if info.FirstTextTime.IsZero() && streamResp.Type == "response.output_text.delta" && streamResp.Delta != "" {
+			info.FirstTextTime = time.Now()
+		}
+		if streamResp.Type == "error" || streamResp.Type == "response.error" || streamResp.Type == "response.failed" || (strictChat && info.StreamStatus.ResponseFailed()) {
 			upstreamFailed = true
+			if strictChat {
+				if streamResp.Response != nil {
+					failedUsage = streamResp.Response.Usage
+				}
+				rawError := gjson.Get(data, "response.error")
+				if !rawError.IsObject() {
+					rawError = gjson.Get(data, "error")
+				}
+				flat := !rawError.IsObject()
+				if flat {
+					rawError = gjson.Parse(data)
+				}
+				wire := types.OpenAIError{}
+				_ = common.UnmarshalJsonStr(rawError.Raw, &wire)
+				if flat {
+					wire.Type = ""
+				}
+				if wire.Code == nil && wire.Type == "" {
+					wire.Code, wire.Type = "server_error", "server_error"
+				}
+				if wire.Message == "" {
+					wire.Message = "upstream Responses stream failed"
+				}
+				status := int(gjson.Get(data, "status_code").Int())
+				if status < 400 || status > 599 {
+					status = http.StatusBadRequest
+				}
+				streamErr = service.NormalizeResponsesRetryError(types.WithOpenAIError(wire, status))
+				stopStream(sr, streamErr)
+				return
+			}
 			if streamResp.Response != nil {
 				failedUsage = streamResp.Response.Usage
 				if oaiErr := streamResp.Response.GetOpenAIError(); oaiErr != nil && oaiErr.Type != "" {
@@ -306,10 +377,31 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 				return
 			}
 		}
+		if info.EarlyResponses != nil && info.StreamStatus.ResponseOutcome() != "" {
+			sr.Done()
+		}
 	})
 
+	if strictChat {
+		info.StreamStatus.RequireTerminal()
+		if c.Request.Context().Err() != nil || info.StreamStatus.EndReason == relaycommon.StreamEndReasonClientGone || info.StreamStatus.EndReason == relaycommon.StreamEndReasonPingFail {
+			usage := state.Usage()
+			if usage == nil {
+				usage = service.ResponseText2Usage(c, state.UsageText(), info.UpstreamModelName, info.GetEstimatePromptTokens())
+			}
+			return usage, nil
+		}
+		if streamErr == nil && (!info.StreamStatus.IsNormalEnd() || info.StreamStatus.HasErrors() || info.StreamStatus.ResponseOutcome() == "") {
+			streamErr = types.WithOpenAIError(types.OpenAIError{Code: "server_error", Type: "server_error", Message: "upstream Responses stream failed or ended before a terminal event"}, http.StatusBadGateway)
+		}
+	}
+
 	if streamErr != nil {
-		if !upstreamFailed || state.UsageText() == "" {
+		if strictChat {
+			streamErr = service.NormalizeResponsesRetryError(streamErr)
+			info.StreamStatus.MarkFailed(string(streamErr.GetErrorCode()), streamErr.ToOpenAIError().Type, streamErr.StatusCode)
+		}
+		if !strictChat && (!upstreamFailed || state.UsageText() == "") {
 			return nil, streamErr
 		}
 		// The upstream failed after output reached the client: bill the
@@ -321,8 +413,11 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			usage = state.Usage()
 		}
 		if usage == nil || usage.TotalTokens == 0 {
-			usage = service.ResponseText2Usage(c, state.UsageText(), info.UpstreamModelName, info.GetEstimatePromptTokens())
-		} else if usage.CompletionTokens == 0 || usage.PromptTokens == 0 {
+			usage = &dto.Usage{}
+			if state.UsageText() != "" || !strictChat {
+				usage = service.ResponseText2Usage(c, state.UsageText(), info.UpstreamModelName, info.GetEstimatePromptTokens())
+			}
+		} else if (usage.CompletionTokens == 0 || usage.PromptTokens == 0) && (state.UsageText() != "" || !strictChat) {
 			// As in the native Responses accumulator, reported usage that
 			// omits the output or the prompt is completed from the estimate of
 			// the delivered output and the prompt.
@@ -338,9 +433,22 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 				usage.BillingUsage = dto.CloneBillingUsageWithEstimatedCompletion(usage.BillingUsage, usage.CompletionTokens)
 			}
 		}
+		if strictChat {
+			if !c.Writer.Written() && usage.TotalTokens == 0 {
+				return nil, streamErr
+			}
+			_ = helper.FailChatStream(c, info, streamErr)
+			if usage.TotalTokens == 0 && state.UsageText() == "" {
+				types.ErrOptionWithSkipRetry()(streamErr)
+				return nil, streamErr
+			}
+			return usage, nil
+		}
 		logger.LogError(c, "responses stream failed after output was delivered, billing the delivered output: "+streamErr.Error())
 		streamErr.SetMessage(common.MessageWithRequestId(streamErr.Error(), c.GetString(common.RequestIdKey)))
-		if info.RelayFormat == types.RelayFormatClaude {
+		if info.EarlyResponses != nil && !info.EarlyResponses.SentAt.IsZero() {
+			_ = helper.FailEarlyResponses(c, info, streamErr)
+		} else if info.RelayFormat == types.RelayFormatClaude {
 			c.JSON(streamErr.StatusCode, gin.H{"type": "error", "error": streamErr.ToClaudeError()})
 		} else {
 			c.JSON(streamErr.StatusCode, gin.H{"error": streamErr.ToOpenAIError()})
@@ -355,6 +463,11 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 	}
 	if info.StreamStatus.EndReason == relaycommon.StreamEndReasonClientGone {
 		return usage, nil
+	}
+	if ack := info.EarlyResponses; ack != nil && ack.Chat {
+		if !ack.SentAt.IsZero() {
+			responseId, createAt = ack.ID, ack.CreatedAt
+		}
 	}
 
 	if info.RelayFormat == types.RelayFormatClaude && info.ClaudeConvertInfo != nil {
@@ -384,6 +497,9 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 
 	if info.RelayFormat == types.RelayFormatOpenAI {
 		helper.Done(c)
+	}
+	if ack := info.EarlyResponses; ack != nil {
+		ack.Finished = true
 	}
 	return usage, nil
 }

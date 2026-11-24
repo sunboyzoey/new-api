@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
+	"strconv"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -118,6 +120,10 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 	userGroup := common.GetContextKeyString(param.Ctx, constant.ContextKeyUserGroup)
 	filters := GetChannelConstraints(param.Ctx).Filters
 
+	if common.GetContextKeyBool(param.Ctx, constant.ContextKeyResponsesChannelFailover) {
+		return selectResponsesFailoverChannel(param, filters)
+	}
+
 	if param.TokenGroup == "auto" {
 		autoGroups := GetRequestAutoGroups(param.Ctx, userGroup)
 		if len(autoGroups) == 0 {
@@ -203,6 +209,49 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 	return channel, selectGroup, nil
 }
 
+// selectResponsesFailoverChannel picks the highest remaining priority after
+// applying the attempt trail. The outer loop owns the request's retry budget.
+func selectResponsesFailoverChannel(param *RetryParam, filters []dto.ChannelFilter) (*model.Channel, string, error) {
+	attempted := make(map[int]bool)
+	for _, rawID := range param.Ctx.GetStringSlice("use_channel") {
+		if id, err := strconv.Atoi(rawID); err == nil {
+			attempted[id] = true
+		}
+	}
+	filters = append(slices.Clip(filters), dto.ChannelFilter{
+		Kind: dto.FilterResponsesFailover, RequestPath: param.RequestPath, AttemptedChannelIDs: attempted,
+	})
+	if param.TokenGroup != "auto" {
+		channel, err := model.GetRandomSatisfiedChannel(param.TokenGroup, param.ModelName, 0, filters)
+		return channel, param.TokenGroup, err
+	}
+
+	current := common.GetContextKeyString(param.Ctx, constant.ContextKeyAutoGroup)
+	groups := GetRequestAutoGroups(param.Ctx, common.GetContextKeyString(param.Ctx, constant.ContextKeyUserGroup))
+	start := slices.Index(groups, current)
+	if start < 0 {
+		return nil, current, nil
+	}
+	ordered := []string{current}
+	if common.GetContextKeyBool(param.Ctx, constant.ContextKeyTokenCrossGroupRetry) {
+		// Affinity can place the first attempt anywhere in the token's group list.
+		ordered = append(ordered, groups[:start]...)
+		ordered = append(ordered, groups[start+1:]...)
+	}
+	for _, group := range ordered {
+		channel, err := model.GetRandomSatisfiedChannel(group, param.ModelName, 0, filters)
+		if err != nil {
+			return nil, group, err
+		}
+		if channel != nil {
+			common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroup, group)
+			common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroupIndex, slices.Index(groups, group))
+			return channel, group, nil
+		}
+	}
+	return nil, current, nil
+}
+
 func pinnedTaskPluginIdentities(c *gin.Context, expected string) ([]int, []string) {
 	if c == nil || expected == "" {
 		return nil, nil
@@ -282,7 +331,11 @@ type ChannelSelectError struct {
 // callers. The caller still applies SetupContextForSelectedChannel.
 func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam) (*model.Channel, string, *ChannelSelectError) {
 	constraints := GetChannelConstraints(c)
+	owner := common.GetContextKeyInt(c, constant.ContextKeyResponsesOwnerChannel)
 	if pin, found, overridden := constraints.ResolvedPin(); found {
+		if owner > 0 && pin.ChannelId != owner {
+			return nil, "", &ChannelSelectError{StatusCode: http.StatusBadRequest, Code: types.ErrorCodeInvalidRequest, Message: "previous_response_id is unavailable on the specified channel"}
+		}
 		for _, lost := range overridden {
 			logger.LogWarn(c, fmt.Sprintf(
 				"channel pin overridden: winning_source=%s winning_channel_id=%d overridden_source=%s overridden_channel_id=%d",
@@ -310,7 +363,11 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 	var channel *model.Channel
 	var selectGroup string
 	if retry.GetRetry() == 0 {
-		if preferredChannelID, found := GetPreferredChannelByAffinity(c, modelName, usingGroup); found {
+		preferredChannelID, found := GetPreferredChannelByAffinity(c, modelName, usingGroup)
+		if owner > 0 {
+			preferredChannelID, found = owner, true
+		}
+		if found {
 			affinityUsable := false
 			preferred, err := model.CacheGetChannel(preferredChannelID)
 			affinitySatisfied := false
@@ -336,6 +393,9 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 					affinityUsable = true
 					MarkChannelAffinityUsed(c, usingGroup, preferred.Id)
 				}
+			}
+			if !affinityUsable && owner > 0 {
+				return nil, "", &ChannelSelectError{StatusCode: http.StatusBadRequest, Code: types.ErrorCodeInvalidRequest, Message: "previous_response_id is unavailable for this group and model"}
 			}
 			if !affinityUsable && !ShouldKeepChannelAffinityOnChannelDisabled() {
 				ClearCurrentChannelAffinityCache(c)

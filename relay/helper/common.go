@@ -3,6 +3,7 @@ package helper
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
@@ -89,9 +90,26 @@ func ResponseChunkData(c *gin.Context, resp dto.ResponsesStreamResponse, data st
 		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
 	}
 
-	c.Render(-1, common.CustomEvent{Data: fmt.Sprintf("event: %s\n", resp.Type)})
-	c.Render(-1, common.CustomEvent{Data: fmt.Sprintf("data: %s", data)})
-	return FlushWriter(c)
+	// CustomEvent rendering discards write errors. Check the complete SSE
+	// frame here so a failed terminal delivery cannot be marked successful.
+	frame := "data: " + data + "\n\n"
+	if resp.Type != "" {
+		frame = "event: " + resp.Type + "\n" + frame
+	}
+	n, err := c.Writer.Write([]byte(frame))
+	if err != nil {
+		return err
+	}
+	if n != len(frame) {
+		return io.ErrShortWrite
+	}
+	// Gin's Flush method has no error return. Reach the underlying writer's
+	// FlushError when available, retaining the normal Flusher fallback.
+	var writer http.ResponseWriter = c.Writer
+	if unwrapper, ok := writer.(interface{ Unwrap() http.ResponseWriter }); ok {
+		writer = unwrapper.Unwrap()
+	}
+	return http.NewResponseController(writer).Flush()
 }
 
 func StringData(c *gin.Context, str string) error {
@@ -116,7 +134,9 @@ func PingData(c *gin.Context) error {
 		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
 	}
 
-	if _, err := c.Writer.Write([]byte(": PING\n\n")); err != nil {
+	// A comment only needs a line terminator. A blank line after a standalone
+	// comment is misread as an empty JSON event by older OpenAI SDK decoders.
+	if _, err := c.Writer.Write([]byte(": PING\n")); err != nil {
 		return fmt.Errorf("write ping data failed: %w", err)
 	}
 	return FlushWriter(c)

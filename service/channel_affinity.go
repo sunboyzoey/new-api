@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/cachex"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -725,7 +726,9 @@ func AppendChannelAffinityAdminInfo(c *gin.Context, other *model.LogOther) {
 }
 
 func RecordChannelAffinity(c *gin.Context, channelID int) {
-	if channelID <= 0 {
+	// A continuation follows the specific response owner. It says nothing
+	// about the preferred channel for other responses sharing a prompt cache.
+	if c == nil || channelID <= 0 || common.GetContextKeyInt(c, constant.ContextKeyResponsesOwnerChannel) > 0 {
 		return
 	}
 	setting := operation_setting.GetChannelAffinitySetting()

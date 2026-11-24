@@ -164,6 +164,37 @@ func TestDecideRelayRetryReasons(t *testing.T) {
 	}
 }
 
+func TestResponsesFailoverPreservesRoutingConstraints(t *testing.T) {
+	upstream := types.WithOpenAIError(types.OpenAIError{Code: "invalid_api_key"}, http.StatusUnauthorized, types.ErrOptionWithSkipRetry())
+	for _, tc := range []struct {
+		name, key, reason string
+		previous, pinned  bool
+		upstreamFailure   bool
+	}{
+		{name: "upstream credentials with cache affinity", key: "prompt_cache_key", upstreamFailure: true, reason: "upstream_channel_failed"},
+		{name: "strict session identity", key: "session.id", upstreamFailure: true, reason: "strict_session"},
+		{name: "previous response with cache affinity", key: "prompt_cache_key", previous: true, upstreamFailure: true, reason: "channel_bound_history"},
+		{name: "pinned token", pinned: true, upstreamFailure: true, reason: "pinned_channel"},
+		{name: "local rejection", key: "prompt_cache_key", reason: "non_retryable_error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			common.SetContextKey(c, constant.ContextKeyResponsesChannelFailover, true)
+			common.SetContextKey(c, constant.ContextKeyResponsesUpstreamRetryable, tc.upstreamFailure)
+			common.SetContextKey(c, constant.ContextKeyResponsesBoundHistory, tc.previous)
+			if tc.key != "" {
+				setChannelAffinityContext(c, channelAffinityMeta{KeySourceType: "gjson", KeySourcePath: tc.key, SkipRetry: true})
+			}
+			if tc.pinned {
+				GetChannelConstraints(c).AddPin(dto.ChannelPin{ChannelId: 7, Source: dto.PinSourceToken, RetryMode: dto.PinRetrySingleAttempt})
+			}
+			decision := DecideRelayRetry(c, upstream, 2)
+			assert.Equal(t, tc.reason, decision.Reason)
+			assert.Equal(t, tc.reason == "upstream_channel_failed", decision.Action == "retry")
+		})
+	}
+}
+
 func TestRequestPolicyEventsReachLogAdminInfo(t *testing.T) {
 	previousAutoDisable := common.AutomaticDisableChannelEnabled
 	common.AutomaticDisableChannelEnabled = true

@@ -84,14 +84,22 @@ func ClaudeErrorWrapperLocal(err error, code string, statusCode int) *dto.Claude
 	return claudeErr
 }
 
-func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFail bool) (newApiErr *types.NewAPIError) {
+func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFail bool) *types.NewAPIError {
+	err, _ := RelayErrorHandlerWithBody(ctx, resp, showBodyWhenFail)
+	return err
+}
+
+// RelayErrorHandlerWithBody returns the same bytes used to classify the error so
+// Responses can check for already-billed work without reading the stream twice.
+func RelayErrorHandlerWithBody(ctx context.Context, resp *http.Response, showBodyWhenFail bool) (newApiErr *types.NewAPIError, responseBody []byte) {
 	newApiErr = types.InitOpenAIError(types.ErrorCodeBadResponseStatusCode, resp.StatusCode)
 
-	responseBody, err := io.ReadAll(resp.Body)
+	defer CloseResponseBodyGracefully(resp)
+	var err error
+	responseBody, err = io.ReadAll(resp.Body)
 	if err != nil {
 		return
 	}
-	CloseResponseBodyGracefully(resp)
 	var errResponse dto.GeneralErrorResponse
 	responseBodyText := string(responseBody)
 	responseBodyPreview := common.LocalLogPreview(responseBodyText)

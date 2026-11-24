@@ -12,6 +12,7 @@ import (
 	openaichannel "github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
@@ -150,6 +151,7 @@ func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor 
 	}
 	defer closer.Close()
 	jsonData = nil
+	helper.PrepareEarlyResponses(info, body)
 	var requestBody io.Reader = body
 
 	var httpResp *http.Response
@@ -173,6 +175,10 @@ func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor 
 		return nil, newApiErr
 	}
 
+	if info.EarlyResponses != nil && !upstreamStream {
+		service.CloseResponseBodyGracefully(httpResp)
+		return nil, types.NewOpenAIError(fmt.Errorf("expected upstream Responses event stream"), types.ErrorCodeBadResponse, http.StatusBadGateway)
+	}
 	if upstreamStream && clientStream {
 		usage, newApiErr := openaichannel.OaiResponsesToChatStreamHandler(c, info, httpResp)
 		if newApiErr != nil {

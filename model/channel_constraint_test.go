@@ -216,3 +216,58 @@ func TestChannelSatisfiesFilters(t *testing.T) {
 	assert.False(t, ok)
 	assert.Equal(t, dto.FilterRequestPath, kind)
 }
+
+func TestResponsesFailoverSelectsHighestUntriedNativeChannel(t *testing.T) {
+	const group = "responses-failover"
+	const model = "test-model"
+	originalCache := common.MemoryCacheEnabled
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalCache
+		InitChannelCache()
+	})
+	truncateTables(t)
+	for _, row := range []struct {
+		id        int
+		kind      int
+		priority  int64
+		converter string
+	}{
+		{901, constant.ChannelTypeAdvancedCustom, 8, "openai_responses_to_openai_chat_completions"},
+		{902, constant.ChannelTypeAdvancedCustom, 7, "none"},
+		{903, constant.ChannelTypeNewAPI, 7, ""},
+		{904, constant.ChannelTypeOpenAI, 4, ""},
+	} {
+		ch := Channel{Id: row.id, Type: row.kind, Status: common.ChannelStatusEnabled, Group: group, Models: model, Priority: &row.priority}
+		if row.converter != "" {
+			upstreamPath := "/v1/responses"
+			if row.converter != "none" {
+				upstreamPath = "/v1/chat/completions"
+			}
+			ch.SetOtherSettings(kitdto.ChannelOtherSettings{AdvancedCustom: &kitdto.AdvancedCustomConfig{
+				Routes: []kitdto.AdvancedCustomRoute{{IncomingPath: "/v1/responses", UpstreamPath: upstreamPath, Converter: row.converter}},
+			}})
+		}
+		require.NoError(t, ch.Insert())
+	}
+	for _, tc := range []struct {
+		name  string
+		cache bool
+	}{{"database", false}, {"cache", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			common.MemoryCacheEnabled = tc.cache
+			InitChannelCache()
+			attempted := map[int]bool{903: true}
+			filters := []dto.ChannelFilter{{Kind: dto.FilterResponsesFailover, RequestPath: "/v1/responses", AttemptedChannelIDs: attempted}}
+			for _, want := range []int{902, 904} {
+				ch, err := GetRandomSatisfiedChannel(group, model, 0, filters)
+				require.NoError(t, err)
+				require.NotNil(t, ch)
+				require.Equal(t, want, ch.Id)
+				attempted[ch.Id] = true
+			}
+			ch, err := GetRandomSatisfiedChannel(group, model, 0, filters)
+			require.NoError(t, err)
+			assert.Nil(t, ch)
+		})
+	}
+}

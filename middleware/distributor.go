@@ -27,8 +27,9 @@ import (
 )
 
 type ModelRequest struct {
-	Model string `json:"model"`
-	Group string `json:"group,omitempty"`
+	Model              string `json:"model"`
+	Group              string `json:"group,omitempty"`
+	PreviousResponseID string `json:"previous_response_id,omitempty"`
 }
 
 func Distribute() func(c *gin.Context) {
@@ -98,6 +99,16 @@ func Distribute() func(c *gin.Context) {
 			}
 		}
 		if pinned || shouldSelectChannel {
+			if modelRequest.PreviousResponseID != "" && c.Request.Method == http.MethodPost && c.Request.URL.Path == "/v1/responses" {
+				owner, err := service.PreviousResponseOwnerChannel(common.GetContextKeyInt(c, constant.ContextKeyUserId), modelRequest.PreviousResponseID)
+				if err != nil {
+					abortWithOpenAiMessage(c, http.StatusServiceUnavailable, err.Error())
+					return
+				}
+				if owner > 0 {
+					common.SetContextKey(c, constant.ContextKeyResponsesOwnerChannel, owner)
+				}
+			}
 			usingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
 			var selectErr *service.ChannelSelectError
 			channel, _, selectErr = service.SelectChannelForRequest(c, modelRequest.Model, &service.RetryParam{
@@ -276,6 +287,17 @@ func getModelFromJSONBody(c *gin.Context) (*ModelRequest, error) {
 	if err != nil {
 		return nil, err
 	}
+	var previousID string
+	if c.Request.URL.Path == "/v1/responses" {
+		previous := gjson.GetBytes(requestBody, "previous_response_id")
+		previousID, err = getJSONStringValue(previous, "previous_response_id")
+		if err != nil {
+			return nil, err
+		}
+		if previous.Exists() && countTopLevelJSONKey(requestBody, "previous_response_id") > 1 {
+			return nil, errors.New("previous_response_id must be provided once")
+		}
+	}
 
 	if _, seekErr := storage.Seek(0, io.SeekStart); seekErr != nil {
 		return nil, seekErr
@@ -283,8 +305,9 @@ func getModelFromJSONBody(c *gin.Context) (*ModelRequest, error) {
 	c.Request.Body = io.NopCloser(storage)
 
 	return &ModelRequest{
-		Model: model,
-		Group: group,
+		Model:              model,
+		Group:              group,
+		PreviousResponseID: previousID,
 	}, nil
 }
 
@@ -447,6 +470,7 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 			return nil, false, err
 		}
 		modelRequest.Model = req.Model
+		modelRequest.PreviousResponseID = req.PreviousResponseID
 	}
 	if strings.HasPrefix(c.Request.URL.Path, "/v1/realtime") {
 		//wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01

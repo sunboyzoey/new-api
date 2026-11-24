@@ -3,14 +3,17 @@ package model
 import (
 	"slices"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
+	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 )
 
 var filterEvalOrder = []dto.ChannelFilterKind{
 	dto.FilterRequestPath,
 	dto.FilterTaskPluginIdentity,
 	dto.FilterResponsesWebSocket,
+	dto.FilterResponsesFailover,
 }
 
 // ChannelSatisfiesFilters reports whether ch passes every filter.
@@ -124,7 +127,31 @@ func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilte
 		default:
 			return false
 		}
+	case dto.FilterResponsesFailover:
+		if filter.AttemptedChannelIDs[ch.Id] || ch.Status != common.ChannelStatusEnabled {
+			return false
+		}
+		apiType, _ := common.ChannelType2APIType(ch.Type)
+		var custom *kitdto.AdvancedCustomConfig
+		if ch.Type == constant.ChannelTypeAdvancedCustom {
+			custom = ch.GetOtherSettings().AdvancedCustom
+		}
+		return SupportsManagedResponses(ch.Type, apiType, custom, filter.RequestPath, modelName)
 	default:
 		return true
+	}
+}
+
+// SupportsManagedResponses reports whether the selected route handles native
+// Responses events, so every failover attempt uses the same error handling.
+func SupportsManagedResponses(channelType, apiType int, custom *kitdto.AdvancedCustomConfig, requestPath, modelName string) bool {
+	switch apiType {
+	case constant.APITypeOpenAI, constant.APITypeOpenRouter, constant.APITypeXinference, constant.APITypeXai, constant.APITypeCloudflare, constant.APITypeCodex, constant.APITypeNewAPI, constant.APITypeSub2API:
+		return true
+	case constant.APITypeAdvancedCustom:
+		route, ok := custom.MatchPathForModel(requestPath, modelName)
+		return channelType == constant.ChannelTypeAdvancedCustom && ok && route.IsNative()
+	default:
+		return false
 	}
 }

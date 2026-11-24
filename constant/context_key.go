@@ -69,6 +69,12 @@ const (
 	ContextKeyLanguage             ContextKey = "language"
 	ContextKeyIsStream             ContextKey = "is_stream"
 	ContextKeyResponseStreamStatus ContextKey = "response_stream_status"
+	// ResponsesChannelFailover lasts across attempts. UpstreamRetryable is
+	// evidence from the current attempt and must be cleared before the next.
+	ContextKeyResponsesChannelFailover   ContextKey = "responses_channel_failover"
+	ContextKeyResponsesUpstreamRetryable ContextKey = "responses_upstream_retryable"
+	ContextKeyResponsesBoundHistory      ContextKey = "responses_bound_history"
+	ContextKeyResponsesOwnerChannel      ContextKey = "responses_owner_channel"
 
 	// ContextKeyAuditLogged marks that the current request has already recorded
 	// a manage/operation audit log inside the handler. When set, the admin-audit

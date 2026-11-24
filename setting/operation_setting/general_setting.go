@@ -10,10 +10,16 @@ const (
 	QuotaDisplayTypeCustom = "CUSTOM"
 )
 
+const DefaultResponsesEarlyAckDelayMS = 100
+
 type GeneralSetting struct {
 	DocsLink            string `json:"docs_link"`
 	PingIntervalEnabled bool   `json:"ping_interval_enabled"`
 	PingIntervalSeconds int    `json:"ping_interval_seconds"`
+	// Commits HTTP 200 for eligible Responses and OpenAI chat SSE before upstream
+	// acceptance. Later failures are reported in the stream; this can be disabled.
+	ResponsesEarlyAckEnabled bool `json:"responses_early_ack_enabled"`
+	ResponsesEarlyAckDelayMS int  `json:"responses_early_ack_delay_ms"`
 	// 当前站点额度展示类型：USD / CNY / TOKENS
 	QuotaDisplayType string `json:"quota_display_type"`
 	// 自定义货币符号，用于 CUSTOM 展示类型
@@ -27,6 +33,8 @@ var generalSetting = GeneralSetting{
 	DocsLink:                   "https://docs.newapi.pro",
 	PingIntervalEnabled:        false,
 	PingIntervalSeconds:        60,
+	ResponsesEarlyAckEnabled:   true,
+	ResponsesEarlyAckDelayMS:   DefaultResponsesEarlyAckDelayMS,
 	QuotaDisplayType:           QuotaDisplayTypeUSD,
 	CustomCurrencySymbol:       "¤",
 	CustomCurrencyExchangeRate: 1.0,

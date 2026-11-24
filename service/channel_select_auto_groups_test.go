@@ -127,3 +127,47 @@ func TestCacheGetRandomSatisfiedChannelUsesTokenAutoGroupsWhenGlobalAutoIsEmpty(
 	assert.Equal(t, "default", selectedGroup)
 	assert.Equal(t, "default", common.GetContextKeyString(ctx, constant.ContextKeyAutoGroup))
 }
+
+func TestResponsesFailoverRespectsAutoGroupAccessAndRetryBudget(t *testing.T) {
+	db := setupChannelSelectAutoGroupsTest(t)
+	const modelName = "responses-auto-failover"
+	createChannelSelectAutoGroupsChannel(t, db, 2201, "vip", modelName)
+	createChannelSelectAutoGroupsChannel(t, db, 2202, "default", modelName)
+	createChannelSelectAutoGroupsChannel(t, db, 2203, "vip", modelName)
+	createChannelSelectAutoGroupsChannel(t, db, 2204, "restricted", modelName)
+	model.InitChannelCache()
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	common.SetContextKey(ctx, constant.ContextKeyUserGroup, "default")
+	common.SetContextKey(ctx, constant.ContextKeyTokenAutoGroups, []string{"default", "vip"})
+	common.SetContextKey(ctx, constant.ContextKeyAutoGroup, "vip")
+	common.SetContextKey(ctx, constant.ContextKeyTokenCrossGroupRetry, true)
+	common.SetContextKey(ctx, constant.ContextKeyResponsesChannelFailover, true)
+	AppendUsedChannel(ctx, 2201)
+	param := &RetryParam{Ctx: ctx, TokenGroup: "auto", ModelName: modelName, RequestPath: "/v1/responses"}
+	param.SetRetry(1)
+
+	ch, group, err := CacheGetRandomSatisfiedChannel(param)
+	require.NoError(t, err)
+	require.NotNil(t, ch)
+	assert.Equal(t, 2203, ch.Id)
+	assert.Equal(t, "vip", group)
+	AppendUsedChannel(ctx, ch.Id)
+
+	common.SetContextKey(ctx, constant.ContextKeyTokenCrossGroupRetry, false)
+	ch, _, err = CacheGetRandomSatisfiedChannel(param)
+	require.NoError(t, err)
+	assert.Nil(t, ch)
+	common.SetContextKey(ctx, constant.ContextKeyTokenCrossGroupRetry, true)
+	ch, group, err = CacheGetRandomSatisfiedChannel(param)
+	require.NoError(t, err)
+	require.NotNil(t, ch)
+	assert.Equal(t, 2202, ch.Id)
+	assert.Equal(t, "default", group)
+	assert.Equal(t, 1, param.GetRetry())
+
+	AppendUsedChannel(ctx, ch.Id)
+	ch, _, err = CacheGetRandomSatisfiedChannel(param)
+	require.NoError(t, err)
+	assert.Nil(t, ch)
+}

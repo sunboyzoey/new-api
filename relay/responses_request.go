@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -13,8 +14,11 @@ import (
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // PrepareResponsesRequest applies the same model, conversion and channel rules
@@ -37,6 +41,18 @@ func PrepareResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, req *d
 	if err != nil {
 		return nil, nil, nil, types.NewError(fmt.Errorf("failed to copy responses request: %w", err), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
 	}
+	if request.PreviousResponseID != "" || gjson.ParseBytes(request.Conversation).Type != gjson.Null {
+		common.SetContextKey(c, constant.ContextKeyResponsesBoundHistory, true)
+	}
+	info.ResponsePreviousAlias = ""
+	resolvedPrevious, aliasErr := service.ResolveEarlyResponseAlias(info.UserId, info.ChannelId, request.PreviousResponseID)
+	if aliasErr != nil {
+		return nil, nil, nil, types.NewErrorWithStatusCode(aliasErr, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+	}
+	if resolvedPrevious != request.PreviousResponseID {
+		info.ResponsePreviousAlias = request.PreviousResponseID
+		request.PreviousResponseID = resolvedPrevious
+	}
 	if err := helper.ModelMappedHelper(c, info, request); err != nil {
 		return nil, nil, nil, types.NewError(err, types.ErrorCodeChannelModelMappedError, types.ErrOptionWithSkipRetry())
 	}
@@ -53,6 +69,21 @@ func PrepareResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, req *d
 		storage, err := common.GetBodyStorage(c)
 		if err != nil {
 			return nil, nil, nil, types.NewError(err, types.ErrorCodeReadRequestBodyFailed, types.ErrOptionWithSkipRetry())
+		}
+		if info.ResponsePreviousAlias != "" {
+			raw, err := storage.Bytes()
+			if err != nil {
+				return nil, nil, nil, types.NewError(err, types.ErrorCodeReadRequestBodyFailed, types.ErrOptionWithSkipRetry())
+			}
+			raw, err = sjson.SetBytes(raw, "previous_response_id", resolvedPrevious)
+			if err != nil {
+				return nil, nil, nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+			}
+			body, closer, err := relaycommon.NewOutboundJSONBody(raw)
+			if err != nil {
+				return nil, nil, nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+			}
+			return adaptor, body, closer, nil
 		}
 		body := common.NewReplayableBodyReader(storage)
 		return adaptor, body, io.NopCloser(body), nil
@@ -78,6 +109,27 @@ func PrepareResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, req *d
 		}
 	}
 
+	// Param overrides must not forward a gateway alias to an upstream.
+	finalPrevious := gjson.GetBytes(jsonData, "previous_response_id").String()
+	if finalPrevious != "" || gjson.GetBytes(jsonData, "conversation").Type != gjson.Null {
+		common.SetContextKey(c, constant.ContextKeyResponsesBoundHistory, true)
+	}
+	// Another gateway can use the same public ID prefix. A value we already
+	// resolved belongs to the upstream and must reach it unchanged.
+	if finalPrevious != resolvedPrevious {
+		info.ResponsePreviousAlias = ""
+		resolvedFinal, err := service.ResolveEarlyResponseAlias(info.UserId, info.ChannelId, finalPrevious)
+		if err != nil {
+			return nil, nil, nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+		}
+		if resolvedFinal != finalPrevious {
+			info.ResponsePreviousAlias = finalPrevious
+			jsonData, err = sjson.SetBytes(jsonData, "previous_response_id", resolvedFinal)
+			if err != nil {
+				return nil, nil, nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+			}
+		}
+	}
 	logger.LogDebug(c, "requestBody: %s", jsonData)
 	body, closer, err := relaycommon.NewOutboundJSONBody(jsonData)
 	if err != nil {
