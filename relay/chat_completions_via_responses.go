@@ -112,7 +112,7 @@ func textRequestViaResponses(c *gin.Context, info *relaycommon.RelayInfo, adapto
 	return relayResponsesRequest(c, info, adaptor, responsesReq, paramOverrideApplied)
 }
 
-func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.Adaptor, responsesReq *dto.OpenAIResponsesRequest, paramOverrideApplied bool) (*dto.Usage, *types.NewAPIError) {
+func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.Adaptor, responsesReq *dto.OpenAIResponsesRequest, paramOverrideApplied bool) (resultUsage *dto.Usage, resultErr *types.NewAPIError) {
 	savedRelayMode := info.RelayMode
 	savedRequestURLPath := info.RequestURLPath
 	defer func() {
@@ -145,12 +145,23 @@ func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor 
 		}
 	}
 
+	var chatEligibility service.ChatStreamReplayPolicy
+	if isChatStreamRequest(c, info) {
+		chatEligibility = service.ClassifyChatStreamReplay(jsonData)
+	}
 	body, closer, err := relaycommon.NewOutboundJSONBody(jsonData)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 	}
 	defer closer.Close()
 	jsonData = nil
+	chatAttempt, prepareErr := startChatStreamAttempt(c, info, chatEligibility)
+	if prepareErr != nil {
+		return nil, prepareErr
+	}
+	if chatAttempt != nil {
+		defer func() { resultErr = chatAttempt.finish(c, info, resultUsage, resultErr) }()
+	}
 	helper.PrepareEarlyResponses(info, body)
 	var requestBody io.Reader = body
 
@@ -175,15 +186,18 @@ func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor 
 		return nil, newApiErr
 	}
 
-	if info.EarlyResponses != nil && !upstreamStream {
+	if (info.EarlyResponses != nil || chatAttempt != nil) && !upstreamStream {
 		service.CloseResponseBodyGracefully(httpResp)
 		return nil, types.NewOpenAIError(fmt.Errorf("expected upstream Responses event stream"), types.ErrorCodeBadResponse, http.StatusBadGateway)
 	}
 	if upstreamStream && clientStream {
+		if chatAttempt != nil {
+			chatAttempt.upstream = httpResp.Body
+		}
 		usage, newApiErr := openaichannel.OaiResponsesToChatStreamHandler(c, info, httpResp)
 		if newApiErr != nil {
 			service.ResetStatusCode(newApiErr, statusCodeMappingStr)
-			return nil, newApiErr
+			return usage, newApiErr
 		}
 		return usage, nil
 	}

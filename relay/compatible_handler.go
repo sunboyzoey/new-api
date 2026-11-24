@@ -26,12 +26,19 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 	info.InitChannelMeta(c)
 	info.EarlyResponses.Stop()
 	info.EarlyResponses = nil
+	var chatAttempt *chatAttemptWriter
 	upstreamStarted := false
 	defer func() {
 		info.EarlyResponses.Stop()
+		if chatAttempt != nil {
+			newAPIError = chatAttempt.finish(c, info, nil, newAPIError)
+		}
 		if newAPIError != nil && upstreamStarted && info.IsStream && info.RelayFormat == types.RelayFormatOpenAI {
 			newAPIError = service.NormalizeResponsesRetryError(newAPIError)
-			if c.Writer.Written() {
+			if c.GetBool("chat_retry_unsafe") {
+				types.ErrOptionWithSkipRetry()(newAPIError)
+			}
+			if c.Writer.Written() && !c.GetBool("chat_retry_managed") {
 				types.ErrOptionWithSkipRetry()(newAPIError)
 				_ = helper.FailChatStream(c, info, newAPIError)
 			}
@@ -98,18 +105,12 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 			return newApiErr
 		}
 
-		var containAudioTokens = usage.CompletionTokenDetails.AudioTokens > 0 || usage.PromptTokensDetails.AudioTokens > 0
-		var containsAudioRatios = ratio_setting.ContainsAudioRatio(info.OriginModelName) || ratio_setting.ContainsAudioCompletionRatio(info.OriginModelName)
-
-		if containAudioTokens && containsAudioRatios {
-			service.PostAudioConsumeQuota(c, info, usage, "")
-		} else {
-			service.PostTextConsumeQuota(c, info, usage, nil)
-		}
+		settleChatUsage(c, info, usage)
 		return nil
 	}
 
 	var requestBody io.Reader
+	var chatEligibility service.ChatStreamReplayPolicy
 
 	if passThroughGlobal || info.ChannelSetting.PassThroughBodyEnabled {
 		storage, err := common.GetBodyStorage(c)
@@ -121,7 +122,11 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 				logger.LogDebug(c, "requestBody: %s", debugBytes)
 			}
 		}
-		requestBody = common.NewReplayableBodyReader(storage)
+		outbound := common.NewReplayableBodyReader(storage)
+		requestBody = outbound
+		if isChatStreamRequest(c, info) {
+			chatEligibility = passthroughChatEligibility(c, outbound)
+		}
 	} else {
 		convertedRequest, err := adaptor.ConvertOpenAIRequest(c, info, request)
 		if err != nil {
@@ -153,6 +158,9 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		}
 
 		logger.LogDebug(c, "text request body: %s", jsonData)
+		if isChatStreamRequest(c, info) {
+			chatEligibility = service.ClassifyChatStreamReplay(jsonData)
+		}
 
 		body, closer, err := relaycommon.NewOutboundJSONBody(jsonData)
 		if err != nil {
@@ -164,6 +172,10 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 	}
 
 	if body, ok := requestBody.(common.ReplayableBody); ok {
+		chatAttempt, newAPIError = startChatStreamAttempt(c, info, chatEligibility)
+		if newAPIError != nil {
+			return newAPIError
+		}
 		helper.PrepareEarlyResponses(info, body)
 	}
 	var httpResp *http.Response
@@ -186,26 +198,36 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		}
 	}
 
-	if info.EarlyResponses != nil && (httpResp == nil || !strings.HasPrefix(strings.ToLower(httpResp.Header.Get("Content-Type")), "text/event-stream")) {
+	if (info.EarlyResponses != nil || chatAttempt != nil) && (httpResp == nil || !strings.HasPrefix(strings.ToLower(httpResp.Header.Get("Content-Type")), "text/event-stream")) {
 		if httpResp != nil {
 			service.CloseResponseBodyGracefully(httpResp)
 		}
 		return types.NewOpenAIError(fmt.Errorf("expected upstream chat event stream"), types.ErrorCodeBadResponse, http.StatusBadGateway)
 	}
+	if chatAttempt != nil {
+		chatAttempt.upstream = httpResp.Body
+	}
 	usage, newApiErr := adaptor.DoResponse(c, httpResp, info)
+	if chatAttempt != nil {
+		observed, _ := usage.(*dto.Usage)
+		newApiErr = chatAttempt.finish(c, info, observed, newApiErr)
+		chatAttempt = nil
+	}
 	if newApiErr != nil {
 		// reset status code 重置状态码
 		service.ResetStatusCode(newApiErr, statusCodeMappingStr)
 		return newApiErr
 	}
 
-	var containAudioTokens = usage.(*dto.Usage).CompletionTokenDetails.AudioTokens > 0 || usage.(*dto.Usage).PromptTokensDetails.AudioTokens > 0
-	var containsAudioRatios = ratio_setting.ContainsAudioRatio(info.OriginModelName) || ratio_setting.ContainsAudioCompletionRatio(info.OriginModelName)
-
-	if containAudioTokens && containsAudioRatios {
-		service.PostAudioConsumeQuota(c, info, usage.(*dto.Usage), "")
-	} else {
-		service.PostTextConsumeQuota(c, info, usage.(*dto.Usage), nil)
-	}
+	settleChatUsage(c, info, usage.(*dto.Usage))
 	return nil
+}
+
+func settleChatUsage(c *gin.Context, info *relaycommon.RelayInfo, usage *dto.Usage) {
+	containsAudioTokens := usage.CompletionTokenDetails.AudioTokens > 0 || usage.PromptTokensDetails.AudioTokens > 0
+	if containsAudioTokens && (ratio_setting.ContainsAudioRatio(info.OriginModelName) || ratio_setting.ContainsAudioCompletionRatio(info.OriginModelName)) {
+		service.PostAudioConsumeQuota(c, info, usage, "")
+	} else {
+		service.PostTextConsumeQuota(c, info, usage, nil)
+	}
 }

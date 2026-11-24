@@ -416,6 +416,11 @@ func newResponsesWSBillingTest(t *testing.T, expression string, handle func(*web
 		c.Set(common.RequestIdKey, "responses-http-billing")
 		Relay(c, types.RelayFormatOpenAIResponses)
 	})
+	engine.POST("/v1/chat/completions", middleware.TokenAuth(), middleware.ModelRequestRateLimit(), middleware.Distribute(), func(c *gin.Context) {
+		defer func() { fixture.httpDone <- struct{}{} }()
+		c.Set(common.RequestIdKey, "chat-http-billing")
+		Relay(c, types.RelayFormatOpenAI)
+	})
 	gateway := httptest.NewServer(engine)
 	fixture.gatewayURL = gateway.URL
 	t.Cleanup(gateway.Close)
@@ -1101,6 +1106,7 @@ data: {"type":"response.failed","response":{"id":"discarded","status":"failed","
 	}{
 		{name: "CPA queue timeout after ack", advanced: true, code: "bps_queue_timeout", firstStatus: 503, attempts: 2, success: true, stream: true, ack: true},
 		{name: "CPA SSE overload after ack", advanced: true, code: "overloaded_error", firstStatus: 502, attempts: 2, success: true, stream: true, ack: true},
+		{name: "CPA numbered keepalive before stream failure", advanced: true, firstEvent: emptySummary + "data: {\"type\":\"keepalive\",\"sequence_number\":1}\n\n" + readFailure, firstStatus: 502, attempts: 2, success: true, stream: true, ack: true},
 		{name: "CPA empty reasoning summary before failure", advanced: true, firstEvent: emptySummary + readFailure, firstStatus: 502, attempts: 2, success: true, stream: true, ack: true},
 		{name: "CPA search and usage before first text", advanced: true, search: true, firstEvent: searchBeforeFailure, firstStatus: 502, attempts: 2, success: true, stream: true, ack: true},
 		{name: "first text before terminal and matching fallback", advanced: true, backupPrefix: "visible prefix", firstEvent: readFailure, firstStatus: 502, attempts: 2, success: true, stream: true, ack: true},

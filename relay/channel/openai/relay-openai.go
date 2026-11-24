@@ -133,10 +133,11 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	var streamFunctionCallNames []string
 	earlyChat := info.EarlyResponses != nil && info.EarlyResponses.Chat
 	strictChat := info.RelayFormat == types.RelayFormatOpenAI
+	immediateChat := earlyChat || (strictChat && c.GetBool("chat_retry_managed"))
 	var streamErr *types.NewAPIError
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
-		if !earlyChat && lastStreamData != "" {
+		if !immediateChat && lastStreamData != "" {
 			if err := HandleStreamFormat(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent); err != nil {
 				common.SysLog("error handling stream format: " + err.Error())
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
@@ -188,7 +189,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 			}
 			// Do not hold the first role/content event for a later frame. Usage
 			// snapshots are still retained above for settlement after the stream.
-			if earlyChat && (info.ShouldIncludeUsage || len(gjson.Get(data, "choices").Array()) > 0) {
+			if immediateChat && (info.ShouldIncludeUsage || len(gjson.Get(data, "choices").Array()) > 0) {
 				if err := HandleStreamFormat(c, info, data, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent); err != nil {
 					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
 					sr.Stop(err)
@@ -240,7 +241,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		info.CountBillableToolCall(dto.BuildInCallFunctionCall, name)
 	}
 
-	if strictChat && streamErr == nil && shouldSendLastResp && !earlyChat && lastStreamData != "" {
+	if strictChat && streamErr == nil && shouldSendLastResp && !immediateChat && lastStreamData != "" {
 		if err := sendStreamData(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent); err != nil {
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
 			return usage, nil
@@ -259,6 +260,9 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 			info.StreamStatus.MarkFailed(string(streamErr.GetErrorCode()), streamErr.ToOpenAIError().Type, streamErr.StatusCode)
 			if !containStreamUsage && responseTextBuilder.Len() == 0 && toolCount == 0 {
 				usage = &dto.Usage{}
+			}
+			if c.GetBool("chat_retry_managed") {
+				return usage, streamErr
 			}
 			// Return uncommitted empty failures to the Router. Otherwise settle
 			// observed usage once and signal failure without a synthetic [DONE].

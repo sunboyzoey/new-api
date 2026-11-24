@@ -289,6 +289,9 @@ func getModelFromJSONBody(c *gin.Context) (*ModelRequest, error) {
 	if err != nil {
 		return nil, err
 	}
+	if c.Request.URL.Path == "/v1/chat/completions" {
+		common.SetContextKey(c, constant.ContextKeyChatStreamReplayPolicy, service.ClassifyChatStreamReplay(requestBody))
+	}
 	var previousID string
 	if c.Request.URL.Path == "/v1/responses" {
 		previous := gjson.GetBytes(requestBody, "previous_response_id")

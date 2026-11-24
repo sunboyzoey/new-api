@@ -96,6 +96,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			}
 			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
+			if c.GetBool("chat_retry_managed") && c.Writer.Written() {
+				_ = helper.FailChatStream(c, relayInfo, newAPIError)
+				return
+			}
 			if c.GetBool("responses_stream_error_sent") || c.GetBool("chat_stream_error_sent") || c.GetBool("responses_early_ack_committed") || (c.GetBool("responses_retry_managed") && c.Writer.Written()) {
 				return
 			}

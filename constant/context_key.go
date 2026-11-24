@@ -75,6 +75,7 @@ const (
 	ContextKeyModelChannelFailover       ContextKey = "model_channel_failover"
 	ContextKeyResponsesChannelFailover   ContextKey = "responses_channel_failover"
 	ContextKeyResponsesPublicPrefix      ContextKey = "responses_public_prefix"
+	ContextKeyChatStreamReplayPolicy     ContextKey = "chat_stream_replay_policy"
 	ContextKeyResponsesPrefixRecovery    ContextKey = "responses_prefix_recovery"
 	ContextKeyResponsesUpstreamRetryable ContextKey = "responses_upstream_retryable"
 	ContextKeyResponsesBoundHistory      ContextKey = "responses_bound_history"

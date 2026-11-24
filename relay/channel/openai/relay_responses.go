@@ -103,34 +103,7 @@ func ResponsesRequestReplaySafe(info *relaycommon.RelayInfo) bool {
 
 // ResponsesToolsReplaySafe checks the tool declarations actually dispatched by a channel.
 func ResponsesToolsReplaySafe(tools gjson.Result) bool {
-	if tools.Type == gjson.Null {
-		return true
-	}
-	if !tools.IsArray() {
-		return false
-	}
-	for _, tool := range tools.Array() {
-		switch tool.Get("type").String() {
-		case "function", "custom", "web_search", "web_search_preview", "web_search_preview_2025_03_11", "file_search":
-		case "namespace":
-			// Namespaced tools remain client-dispatched when every member is a
-			// function or custom proposal. Check members before allowing replay.
-			members := tool.Get("tools")
-			if !members.IsArray() {
-				return false
-			}
-			for _, member := range members.Array() {
-				switch member.Get("type").String() {
-				case "function", "custom":
-				default:
-					return false
-				}
-			}
-		default:
-			return false
-		}
-	}
-	return true
+	return service.OpenAIToolsReplaySafe(tools)
 }
 
 func responsesOutputReplaySafe(kind string) bool {
@@ -311,6 +284,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		if streamResponse.Response != nil {
 			data = string(rewriteSGLangResponsesCreatedAt(info, []byte(data), "response.created_at", streamResponse.Response.CreatedAt))
 		}
+		readable, answer := responsesStreamText(&streamResponse)
 		if managed {
 			if streamResponse.Type == "" {
 				upstreamFailure = true
@@ -321,7 +295,8 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			status := gjson.Get(data, "response.status").String()
 			failed := streamResponse.Type == "error" || streamResponse.Type == "response.error" || streamResponse.Type == "response.failed" || status == "failed"
 			cancelled := streamResponse.Type == "response.cancelled" || streamResponse.Type == "response.canceled" || status == "cancelled" || status == "canceled"
-			if progressiveRetry && replaySafe {
+			keepalive := progressiveRetry && responsesTransportKeepalive(streamResponse.Type, data)
+			if progressiveRetry && replaySafe && !keepalive {
 				replaySafe = responsesEventReplaySafe(&streamResponse)
 			}
 			if failed || (channelFailover && cancelled) {
@@ -367,12 +342,16 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			}
 			if progressiveRetry {
 				accumulator.Observe(&streamResponse, common.StringToByteSlice(data))
-				if !forwarding && info.StreamStatus.ResponseOutcome() == "" && !responsesHasReadableText(&streamResponse) && replaySafe {
-					if err := attemptFrames.append(data); err != nil {
-						upstreamFailure = true
-						attemptError = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusServiceUnavailable)
-						sr.Stop(err)
-						return
+				if keepalive || (!forwarding && info.StreamStatus.ResponseOutcome() == "" && !readable && replaySafe) {
+					// A transport heartbeat belongs to this connection only. A new
+					// channel can answer without reproducing it in the public prefix.
+					if !keepalive {
+						if err := attemptFrames.append(data); err != nil {
+							upstreamFailure = true
+							attemptError = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusServiceUnavailable)
+							sr.Stop(err)
+							return
+						}
 					}
 					if err := helper.SendBufferedResponsesProgress(c, info); err != nil {
 						info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
@@ -522,20 +501,6 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		if !progressiveRetry {
 			accumulator.Observe(&streamResponse, common.StringToByteSlice(data))
 		}
-		if info.FirstTextTime.IsZero() {
-			hasText := streamResponse.Type == "response.output_text.delta" && streamResponse.Delta != ""
-			hasText = hasText || (streamResponse.Type == "response.output_text.done" && streamResponse.Text != nil && *streamResponse.Text != "")
-			if streamResponse.Response != nil {
-				for _, output := range streamResponse.Response.Output {
-					for _, part := range output.Content {
-						hasText = hasText || (part.Type == "output_text" && part.Text != "")
-					}
-				}
-			}
-			if hasText {
-				info.FirstTextTime = time.Now()
-			}
-		}
 		eventType, rewritten, rewriteErr := helper.RewriteEarlyResponsesEvent(c, info, streamResponse, data)
 		if rewriteErr != nil {
 			info.StreamStatus.MarkFailed("early_ack_rewrite_failed", "server_error", http.StatusBadGateway)
@@ -566,6 +531,9 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			}
 			sr.Stop(err)
 			return
+		}
+		if answer && info.FirstTextTime.IsZero() {
+			info.FirstTextTime = time.Now()
 		}
 		// Responses terminal events carry the final usage. Do not wait for an
 		// optional [DONE] or EOF after forwarding one to the client.
@@ -621,44 +589,67 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	return usage, nil
 }
 
-// Responses streams can place the first text on a delta, a part, an output
-// item or a response snapshot. Release each form at the same boundary.
-func responsesHasReadableText(event *dto.ResponsesStreamResponse) bool {
+// Responses can first expose text in a delta, part, item or response snapshot.
+// Reasoning and refusals also stream immediately but do not start the answer metric.
+func responsesStreamText(event *dto.ResponsesStreamResponse) (readable, answer bool) {
 	switch event.Type {
-	case "response.output_text.delta", "response.reasoning_text.delta", "response.reasoning_summary_text.delta",
-		"response.refusal.delta", "response.audio_transcript.delta":
-		return event.Delta != ""
-	case "response.output_text.done", "response.reasoning_text.done", "response.reasoning_summary_text.done",
-		"response.refusal.done", "response.audio_transcript.done":
-		return event.Text != nil && *event.Text != ""
+	case "response.output_text.delta":
+		return event.Delta != "", event.Delta != ""
+	case "response.output_text.done":
+		present := event.Text != nil && *event.Text != ""
+		return present, present
+	case "response.reasoning_text.delta", "response.reasoning_summary_text.delta", "response.refusal.delta", "response.audio_transcript.delta":
+		return event.Delta != "", false
+	case "response.reasoning_text.done", "response.reasoning_summary_text.done", "response.refusal.done", "response.audio_transcript.done":
+		return event.Text != nil && *event.Text != "", false
 	}
 	if event.Part != nil && event.Part.Text != "" {
-		return true
+		readable = true
+		answer = event.Part.Type == "output_text" && (event.Type == "response.content_part.added" || event.Type == "response.content_part.done")
 	}
-	hasText := func(item *dto.ResponsesOutput) bool {
+	observeItem := func(item *dto.ResponsesOutput) {
 		for _, part := range item.Content {
 			if part.Text != "" {
-				return true
+				readable = true
+				answer = answer || (item.Type == "message" && part.Type == "output_text")
 			}
 		}
 		for _, part := range item.Summary {
-			if part.Text != "" {
-				return true
-			}
+			readable = readable || part.Text != ""
 		}
-		return false
 	}
-	if event.Item != nil && hasText(event.Item) {
-		return true
+	if event.Item != nil {
+		observeItem(event.Item)
 	}
 	if event.Response != nil {
 		for i := range event.Response.Output {
-			if hasText(&event.Response.Output[i]) {
-				return true
-			}
+			observeItem(&event.Response.Output[i])
 		}
 	}
-	return false
+	return readable, answer
+}
+
+// Accept only an empty transport signal with optional sequence numbering.
+// Additional fields may carry output or an externally executed tool action.
+func responsesTransportKeepalive(kind, data string) bool {
+	switch kind {
+	case "keepalive", "heartbeat", "ping", "response.keepalive", "response.heartbeat":
+	default:
+		return false
+	}
+	signal := true
+	gjson.Parse(data).ForEach(func(key, value gjson.Result) bool {
+		switch key.String() {
+		case "type":
+			signal = value.Type == gjson.String && value.String() == kind
+		case "sequence_number":
+			signal = value.Type == gjson.Number
+		default:
+			signal = false
+		}
+		return signal
+	})
+	return signal
 }
 
 // Unknown hosted actions may have side effects at the upstream even when the

@@ -647,6 +647,10 @@ func TestResponsesProgressiveAttemptDelivery(t *testing.T) {
 		failed bool
 		retry  bool
 	}{
+		{"numbered keepalive before upstream failure", []string{`{"type":"keepalive","sequence_number":1}`, failed}, "", true, true},
+		{"heartbeat after search progress", []string{search, `{"sequence_number":1,"type":"heartbeat"}`, failed}, "", true, true},
+		{"keepalive with an external action blocks replay", []string{delta, `{"type":"keepalive","item":{"type":"mcp_call"}}`, failed}, "", true, false},
+		{"unknown event of the same length blocks replay", []string{delta, `{"type":"newaction","sequence_number":1}`, failed}, "", true, false},
 		{"hosted search fails before visible text", []string{search, failed}, `[{"type":"namespace","tools":[{"type":"function"}]},{"type":"web_search"}]`, true, true},
 		{"unexpected external action blocks replay", []string{delta, external, failed}, "", true, false},
 		{"success releases original event sequence", []string{delta, search, completed}, "", false, false},
@@ -688,6 +692,47 @@ func TestResponsesProgressiveAttemptDelivery(t *testing.T) {
 				}
 				assert.Equal(t, want.String(), recorder.Body.String())
 			}
+		})
+	}
+}
+
+func TestResponsesFirstTextOnDelivery(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	const completed = `{"type":"response.completed","response":{"status":"completed"}}`
+	for _, tc := range []struct {
+		name       string
+		event      string
+		wantText   bool
+		flushFails bool
+	}{
+		{name: "part contains first answer", event: `{"type":"response.content_part.added","part":{"type":"output_text","text":"answer"}}`, wantText: true},
+		{name: "item contains first answer", event: `{"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"answer"}]}}`, wantText: true},
+		{name: "reasoning is not an answer", event: `{"type":"response.reasoning_summary_text.delta","delta":"thinking"}`},
+		{name: "tool proposal is not an answer", event: `{"type":"response.function_call_arguments.delta","delta":"arguments"}`},
+		{name: "empty answer", event: `{"type":"response.content_part.added","part":{"type":"output_text","text":""}}`},
+		{name: "failed answer flush", event: `{"type":"response.output_text.delta","delta":"not delivered"}`, flushFails: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writer := &responsesDeliveryWriter{ResponseRecorder: httptest.NewRecorder()}
+			if tc.flushFails {
+				writer.flushErr = errors.New("downstream write failed")
+			}
+			c, _ := gin.CreateTestContext(writer)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			common.SetContextKey(c, constant.ContextKeyResponsesChannelFailover, true)
+			c.Set("responses_retry_managed", true)
+			info := &relaycommon.RelayInfo{ResponsesRetryManaged: true, DisablePing: true, ChannelMeta: &relaycommon.ChannelMeta{}}
+			stream := "data: " + tc.event + "\n\ndata: " + completed + "\n\n"
+			_, err := OaiResponsesStreamHandler(c, info, &http.Response{Body: io.NopCloser(strings.NewReader(stream))})
+			if tc.flushFails {
+				require.NotNil(t, err)
+			} else {
+				require.Nil(t, err)
+				assert.Contains(t, writer.Body.String(), tc.event)
+			}
+			assert.Equal(t, tc.wantText, !info.FirstTextTime.IsZero())
 		})
 	}
 }

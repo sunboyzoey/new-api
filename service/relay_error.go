@@ -35,16 +35,18 @@ func DecideRelayRetry(c *gin.Context, err *types.NewAPIError, retryTimes int) Po
 	if c.GetBool("responses_content_delivered") && !prefixRecovery {
 		return PolicyDecision{Action: "stop", Reason: "content_delivered", Source: "system"}
 	}
-	if c.GetBool("responses_early_ack_committed") && !c.GetBool("responses_retry_managed") {
+	managedChat := c.GetBool("chat_retry_managed")
+	managedStream := managedChat || c.GetBool("responses_retry_managed")
+	if c.GetBool("responses_early_ack_committed") && !managedStream {
 		return PolicyDecision{Action: "stop", Reason: "early_response_committed", Source: "system"}
 	}
 	// Non-managed streams cannot be replayed once downstream bytes were sent.
-	if c.Writer.Written() && common.GetContextKeyBool(c, constant.ContextKeyIsStream) && !c.GetBool("responses_retry_managed") {
+	if c.Writer.Written() && common.GetContextKeyBool(c, constant.ContextKeyIsStream) && !managedStream {
 		return PolicyDecision{Action: "stop", Reason: "stream_committed", Source: "system"}
 	}
 	modelRelay := common.GetContextKeyBool(c, constant.ContextKeyModelChannelFailover)
 	failover := common.GetContextKeyBool(c, constant.ContextKeyResponsesChannelFailover)
-	if modelRelay && c.Writer.Written() && !c.GetBool("responses_retry_managed") {
+	if modelRelay && c.Writer.Written() && !managedStream {
 		return PolicyDecision{Action: "stop", Reason: "response_committed", Source: "system"}
 	}
 	if common.GetContextKeyInt(c, constant.ContextKeyResponsesOwnerChannel) > 0 || ((modelRelay || failover) && common.GetContextKeyBool(c, constant.ContextKeyResponsesBoundHistory)) {
@@ -68,7 +70,7 @@ func DecideRelayRetry(c *gin.Context, err *types.NewAPIError, retryTimes int) Po
 	if modelRelay || failover {
 		upstreamFailure := common.GetContextKeyBool(c, constant.ContextKeyResponsesUpstreamRetryable)
 		if !failover {
-			upstreamFailure = !types.IsSkipRetryError(err) && (err.GetErrorType() != types.ErrorTypeNewAPIError || err.GetErrorCode() == types.ErrorCodeDoRequestFailed)
+			upstreamFailure = !types.IsSkipRetryError(err) && ((managedChat && upstreamFailure) || err.GetErrorType() != types.ErrorTypeNewAPIError || err.GetErrorCode() == types.ErrorCodeDoRequestFailed)
 		}
 		channelSetupFailure := err.GetErrorType() == types.ErrorTypeNewAPIError && types.IsChannelError(err)
 		if (!upstreamFailure && !channelSetupFailure) || IsViolationFeeCode(err.GetErrorCode()) {

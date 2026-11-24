@@ -316,6 +316,9 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			info.ObserveResponseModel(streamResp.Response.Model)
 		}
 		service.ObserveResponsesOutcome(info, &streamResp)
+		if c.GetBool("chat_retry_managed") && !responsesEventReplaySafe(&streamResp) && !responsesTransportKeepalive(streamResp.Type, data) {
+			c.Set("chat_retry_unsafe", true)
+		}
 		if info.FirstTextTime.IsZero() && streamResp.Type == "response.output_text.delta" && streamResp.Delta != "" {
 			info.FirstTextTime = time.Now()
 		}
@@ -434,6 +437,9 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			}
 		}
 		if strictChat {
+			if c.GetBool("chat_retry_managed") {
+				return usage, streamErr
+			}
 			if !c.Writer.Written() && usage.TotalTokens == 0 {
 				return nil, streamErr
 			}

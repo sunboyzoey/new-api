@@ -3,6 +3,7 @@ package middleware
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -412,4 +413,36 @@ func TestSharedEndpointRebindsToBoundNewAPIExtension(t *testing.T) {
 	require.Nil(t, SetupContextForSelectedChannel(c, channel, "task-model"))
 	assert.Equal(t, "alpha", c.GetString("task_plugin_key"), "the first bound candidate executes regardless of the earlier pin")
 	assert.Equal(t, "alpha", c.MustGet(jsplugin.ContextKeyPinnedEndpoint).(jsplugin.PinnedEndpoint).Plugin.Meta.Key)
+}
+
+func TestLargeChatRequestCachesReplayPolicy(t *testing.T) {
+	router := gin.New()
+	router.POST("/v1/chat/completions", func(c *gin.Context) {
+		defer common.CleanupBodyStorage(c)
+		model, _, err := getModelRequest(c)
+		if err != nil {
+			t.Error(err)
+			c.Status(http.StatusBadRequest)
+			return
+		}
+		require.Equal(t, "large-chat", model.Model)
+		policy, found := common.GetContextKeyType[service.ChatStreamReplayPolicy](c, constant.ContextKeyChatStreamReplayPolicy)
+		require.True(t, found)
+		c.String(http.StatusOK, "%d", policy)
+	})
+	for _, tc := range []struct {
+		extra    string
+		expected service.ChatStreamReplayPolicy
+	}{
+		{"", service.ChatStreamReplayable},
+		{",\"tools\":[{\"type\":\"mcp\"}]", service.ChatStreamExternalWork},
+	} {
+		body := io.MultiReader(strings.NewReader(`{"model":"large-chat","stream":true,"messages":[{"role":"user","content":"`), strings.NewReader(strings.Repeat("x", 8<<20)), strings.NewReader(`"}]`+tc.extra+"}"))
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", body)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		require.Equal(t, http.StatusOK, rec.Code)
+		require.Equal(t, fmt.Sprint(tc.expected), rec.Body.String())
+	}
 }
