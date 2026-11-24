@@ -133,8 +133,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		return
 	}
 
-	// Only native Responses uses the content-aware retry gate. Other protocols
-	// retain their existing forwarding and retry behavior.
+	httpRelay := relayFormat != types.RelayFormatOpenAIRealtime
+	common.SetContextKey(c, constant.ContextKeyModelChannelFailover, httpRelay)
+	// Native Responses may acknowledge the request before a channel completes.
 	relayInfo.ResponsesRetryManaged = relayFormat == types.RelayFormatOpenAIResponses && relayInfo.IsStream && relayInfo.RelayMode == relayconstant.RelayModeResponses
 	if relayInfo.ResponsesRetryManaged {
 		c.Set("responses_retry_managed", true)
@@ -177,7 +178,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	relayInfo.LastError = nil
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
-		if common.GetContextKeyBool(c, constant.ContextKeyResponsesChannelFailover) && relayInfo.LastError != nil && c.Request.Context().Err() != nil {
+		if httpRelay && relayInfo.LastError != nil && c.Request.Context().Err() != nil {
 			newAPIError = relayInfo.LastError
 			break
 		}
@@ -185,43 +186,47 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		relayInfo.PerformanceBusinessRejection = false
 		relayInfo.PerformanceOutputTokens = 0
 		relayInfo.RetryIndex = retryParam.GetRetry()
+		common.SetContextKey(c, constant.ContextKeyResponsesUpstreamRetryable, false)
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
-		if channelErr != nil {
+		if channelErr != nil && (channel == nil || !httpRelay) {
 			logger.LogError(c, channelErr.Error())
 			newAPIError = channelErr
-			if (relayInfo.ResponsesRetryManaged || common.GetContextKeyBool(c, constant.ContextKeyResponsesChannelFailover)) && relayInfo.LastError != nil {
+			if httpRelay && relayInfo.LastError != nil {
 				newAPIError = relayInfo.LastError
 			}
 			break
 		}
 		service.AppendUsedChannel(c, channel.Id)
-		if billingErr := service.PrepareTieredBillingForSelectedGroup(c, relayInfo); billingErr != nil {
-			newAPIError = billingErr
-			break
-		}
-
-		bodyStorage, bodyErr := common.GetBodyStorage(c)
-		if bodyErr != nil {
-			// Ensure consistent 413 for oversized bodies even when error occurs later (e.g., retry path)
-			if common.IsRequestBodyTooLargeError(bodyErr) || errors.Is(bodyErr, common.ErrRequestBodyTooLarge) {
-				newAPIError = types.NewErrorWithStatusCode(bodyErr, types.ErrorCodeReadRequestBodyFailed, http.StatusRequestEntityTooLarge, types.ErrOptionWithSkipRetry())
-			} else {
-				newAPIError = types.NewErrorWithStatusCode(bodyErr, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
-			}
-			break
-		}
-		c.Request.Body = io.NopCloser(bodyStorage)
-
 		attemptedChannelID = channel.Id
-		switch relayFormat {
-		case types.RelayFormatOpenAIRealtime:
-			newAPIError = relay.WssHelper(c, relayInfo)
-		case types.RelayFormatClaude:
-			newAPIError = relay.ClaudeHelper(c, relayInfo)
-		case types.RelayFormatGemini:
-			newAPIError = geminiRelayHandler(c, relayInfo)
-		default:
-			newAPIError = relayHandler(c, relayInfo)
+		newAPIError = channelErr
+		if channelErr == nil {
+			if billingErr := service.PrepareTieredBillingForSelectedGroup(c, relayInfo); billingErr != nil {
+				newAPIError = billingErr
+				break
+			}
+
+			bodyStorage, bodyErr := common.GetBodyStorage(c)
+			if bodyErr != nil {
+				// Ensure consistent 413 for oversized bodies even when error occurs later (e.g., retry path)
+				if common.IsRequestBodyTooLargeError(bodyErr) || errors.Is(bodyErr, common.ErrRequestBodyTooLarge) {
+					newAPIError = types.NewErrorWithStatusCode(bodyErr, types.ErrorCodeReadRequestBodyFailed, http.StatusRequestEntityTooLarge, types.ErrOptionWithSkipRetry())
+				} else {
+					newAPIError = types.NewErrorWithStatusCode(bodyErr, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+				}
+				break
+			}
+			c.Request.Body = io.NopCloser(bodyStorage)
+
+			switch relayFormat {
+			case types.RelayFormatOpenAIRealtime:
+				newAPIError = relay.WssHelper(c, relayInfo)
+			case types.RelayFormatClaude:
+				newAPIError = relay.ClaudeHelper(c, relayInfo)
+			case types.RelayFormatGemini:
+				newAPIError = geminiRelayHandler(c, relayInfo)
+			default:
+				newAPIError = relayHandler(c, relayInfo)
+			}
 		}
 
 		if newAPIError == nil {
@@ -238,9 +243,8 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		relayInfo.LastError = newAPIError
 
 		remaining := common.RetryTimes - retryParam.GetRetry()
-		if common.GetContextKeyBool(c, constant.ContextKeyResponsesChannelFailover) {
-			// Auto-group selection may have reset the legacy priority index
-			// before this request reached its first native CPA channel.
+		if httpRelay {
+			// Auto-group selection may reset the legacy priority index.
 			remaining = min(remaining, common.RetryTimes+1-len(c.GetStringSlice("use_channel")))
 		}
 		decision := service.DecideRelayRetry(c, newAPIError, remaining)
@@ -299,7 +303,7 @@ var upgrader = websocket.Upgrader{
 }
 
 func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service.RetryParam) (*model.Channel, *types.NewAPIError) {
-	if info.ChannelMeta == nil {
+	if info.ChannelMeta == nil && len(c.GetStringSlice("use_channel")) == 0 {
 		autoBan := c.GetBool("auto_ban")
 		autoBanInt := 1
 		if !autoBan {
@@ -312,24 +316,27 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 			AutoBan: &autoBanInt,
 		}
 		service.RequestPolicy(c).BeginAttempt(channel, info.UsingGroup)
-		return channel, nil
+		setupErr, _ := common.GetContextKeyType[*types.NewAPIError](c, constant.ContextKeyChannelSetupError)
+		return channel, setupErr
 	}
 	channel, selectGroup, err := service.CacheGetRandomSatisfiedChannel(retryParam)
 	if err != nil {
 		return nil, types.NewError(fmt.Errorf("获取分组 %s 下模型 %s 的可用渠道失败（retry）: %s", selectGroup, info.OriginModelName, err.Error()), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
 	if channel == nil {
+		if info.LastError != nil && common.GetContextKeyBool(c, constant.ContextKeyModelChannelFailover) {
+			service.RequestPolicy(c).AddEvent(service.PolicyEvent{
+				ChannelID: c.GetInt("channel_id"), Status: info.LastError.StatusCode, ErrorCode: string(info.LastError.GetErrorCode()),
+				Decision: service.PolicyDecision{Action: "stop", Reason: "no_alternative_channel", Source: "routing"},
+			})
+		}
 		return nil, types.NewError(fmt.Errorf("分组 %s 下模型 %s 的可用渠道不存在（retry）", selectGroup, info.OriginModelName), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
 
 	info.PriceData.GroupRatioInfo = helper.HandleGroupRatio(c, info)
 
 	service.RequestPolicy(c).BeginAttempt(channel, selectGroup)
-	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, info.OriginModelName)
-	if newAPIError != nil {
-		return nil, newAPIError
-	}
-	return channel, nil
+	return channel, middleware.SetupContextForSelectedChannel(c, channel, info.OriginModelName)
 }
 
 func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {

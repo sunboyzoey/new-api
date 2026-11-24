@@ -205,7 +205,7 @@ func filterAbilitiesByConstraints(abilities []Ability, modelName string, filters
 
 func requiresChannelLookup(filters []dto.ChannelFilter) bool {
 	for _, filter := range filters {
-		if filter.Kind == dto.FilterResponsesFailover || (filter.Kind == dto.FilterTaskPluginIdentity && filter.TaskPluginKey != "") {
+		if filter.Kind == dto.FilterRelayFailover || (filter.Kind == dto.FilterTaskPluginIdentity && filter.TaskPluginKey != "") {
 			return true
 		}
 	}

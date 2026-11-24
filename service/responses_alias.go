@@ -91,9 +91,8 @@ func PreviousResponseOwnerChannel(userID int, id string) (int, error) {
 }
 
 func ResolveEarlyResponseAlias(userID, channelID int, id string) (string, error) {
-	if !strings.HasPrefix(id, EarlyResponseIDPrefix) {
-		return id, nil
-	}
+	// An upstream-first stream can retain the original public ID after a
+	// different channel supplies the successful completion.
 	owner, upstreamID, err := responseOwner(userID, id)
 	if err != nil {
 		return "", err
@@ -103,6 +102,9 @@ func ResolveEarlyResponseAlias(userID, channelID int, id string) (string, error)
 	}
 	if owner > 0 {
 		return "", fmt.Errorf("previous_response_id alias belongs to another channel; resend conversation input")
+	}
+	if !strings.HasPrefix(id, EarlyResponseIDPrefix) {
+		return id, nil
 	}
 	// Aliases created before owner routing used the selected channel in the key.
 	resolved, found, err := responsesAliasCache().Get(fmt.Sprintf("%d:%d:%s", userID, channelID, id))

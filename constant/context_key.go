@@ -71,7 +71,11 @@ const (
 	ContextKeyResponseStreamStatus ContextKey = "response_stream_status"
 	// ResponsesChannelFailover lasts across attempts. UpstreamRetryable is
 	// evidence from the current attempt and must be cleared before the next.
+	ContextKeyChannelSetupError          ContextKey = "channel_setup_error"
+	ContextKeyModelChannelFailover       ContextKey = "model_channel_failover"
 	ContextKeyResponsesChannelFailover   ContextKey = "responses_channel_failover"
+	ContextKeyResponsesPublicPrefix      ContextKey = "responses_public_prefix"
+	ContextKeyResponsesPrefixRecovery    ContextKey = "responses_prefix_recovery"
 	ContextKeyResponsesUpstreamRetryable ContextKey = "responses_upstream_retryable"
 	ContextKeyResponsesBoundHistory      ContextKey = "responses_bound_history"
 	ContextKeyResponsesOwnerChannel      ContextKey = "responses_owner_channel"

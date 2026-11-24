@@ -257,7 +257,7 @@ func TestResponsesFailoverSelectsHighestUntriedNativeChannel(t *testing.T) {
 			common.MemoryCacheEnabled = tc.cache
 			InitChannelCache()
 			attempted := map[int]bool{903: true}
-			filters := []dto.ChannelFilter{{Kind: dto.FilterResponsesFailover, RequestPath: "/v1/responses", AttemptedChannelIDs: attempted}}
+			filters := []dto.ChannelFilter{{Kind: dto.FilterRelayFailover, RequestPath: "/v1/responses", NativeResponsesOnly: true, AttemptedChannelIDs: attempted}}
 			for _, want := range []int{902, 904} {
 				ch, err := GetRandomSatisfiedChannel(group, model, 0, filters)
 				require.NoError(t, err)
@@ -266,6 +266,18 @@ func TestResponsesFailoverSelectsHighestUntriedNativeChannel(t *testing.T) {
 				attempted[ch.Id] = true
 			}
 			ch, err := GetRandomSatisfiedChannel(group, model, 0, filters)
+			require.NoError(t, err)
+			assert.Nil(t, ch)
+
+			// An ordinary HTTP relay can use the compatible converting route,
+			// but it must still exclude each previously selected channel.
+			filters[0].NativeResponsesOnly = false
+			ch, err = GetRandomSatisfiedChannel(group, model, 0, filters)
+			require.NoError(t, err)
+			require.NotNil(t, ch)
+			assert.Equal(t, 901, ch.Id)
+			attempted[ch.Id] = true
+			ch, err = GetRandomSatisfiedChannel(group, model, 0, filters)
 			require.NoError(t, err)
 			assert.Nil(t, ch)
 		})

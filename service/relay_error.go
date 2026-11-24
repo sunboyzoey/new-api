@@ -31,7 +31,8 @@ func DecideRelayRetry(c *gin.Context, err *types.NewAPIError, retryTimes int) Po
 		}
 		return PolicyDecision{Action: "stop", Reason: "client_cancelled", Source: "system"}
 	}
-	if c.GetBool("responses_content_delivered") {
+	prefixRecovery := c.GetBool("responses_retry_managed") && common.GetContextKeyBool(c, constant.ContextKeyResponsesPrefixRecovery)
+	if c.GetBool("responses_content_delivered") && !prefixRecovery {
 		return PolicyDecision{Action: "stop", Reason: "content_delivered", Source: "system"}
 	}
 	if c.GetBool("responses_early_ack_committed") && !c.GetBool("responses_retry_managed") {
@@ -41,16 +42,20 @@ func DecideRelayRetry(c *gin.Context, err *types.NewAPIError, retryTimes int) Po
 	if c.Writer.Written() && common.GetContextKeyBool(c, constant.ContextKeyIsStream) && !c.GetBool("responses_retry_managed") {
 		return PolicyDecision{Action: "stop", Reason: "stream_committed", Source: "system"}
 	}
+	modelRelay := common.GetContextKeyBool(c, constant.ContextKeyModelChannelFailover)
 	failover := common.GetContextKeyBool(c, constant.ContextKeyResponsesChannelFailover)
-	if common.GetContextKeyInt(c, constant.ContextKeyResponsesOwnerChannel) > 0 || (failover && common.GetContextKeyBool(c, constant.ContextKeyResponsesBoundHistory)) {
+	if modelRelay && c.Writer.Written() && !c.GetBool("responses_retry_managed") {
+		return PolicyDecision{Action: "stop", Reason: "response_committed", Source: "system"}
+	}
+	if common.GetContextKeyInt(c, constant.ContextKeyResponsesOwnerChannel) > 0 || ((modelRelay || failover) && common.GetContextKeyBool(c, constant.ContextKeyResponsesBoundHistory)) {
 		return PolicyDecision{Action: "stop", Reason: "channel_bound_history", Source: "routing"}
 	}
-	if failover {
+	if modelRelay || failover {
 		if _, pinned, _ := GetChannelConstraints(c).ResolvedPin(); pinned {
 			return PolicyDecision{Action: "stop", Reason: "pinned_channel", Source: "channel_constraint"}
 		}
 	}
-	if ShouldSkipRetryAfterChannelAffinityFailure(c) {
+	if !modelRelay && ShouldSkipRetryAfterChannelAffinityFailure(c) {
 		meta, _ := getChannelAffinityMeta(c)
 		if !failover || meta.KeySourceType != "gjson" || meta.KeySourcePath != "prompt_cache_key" {
 			source := RequestPolicy(c).SessionModeSource
@@ -60,8 +65,13 @@ func DecideRelayRetry(c *gin.Context, err *types.NewAPIError, retryTimes int) Po
 			return PolicyDecision{Action: "stop", Reason: "strict_session", Source: source}
 		}
 	}
-	if failover {
-		if !common.GetContextKeyBool(c, constant.ContextKeyResponsesUpstreamRetryable) || IsViolationFeeCode(err.GetErrorCode()) {
+	if modelRelay || failover {
+		upstreamFailure := common.GetContextKeyBool(c, constant.ContextKeyResponsesUpstreamRetryable)
+		if !failover {
+			upstreamFailure = !types.IsSkipRetryError(err) && (err.GetErrorType() != types.ErrorTypeNewAPIError || err.GetErrorCode() == types.ErrorCodeDoRequestFailed)
+		}
+		channelSetupFailure := err.GetErrorType() == types.ErrorTypeNewAPIError && types.IsChannelError(err)
+		if (!upstreamFailure && !channelSetupFailure) || IsViolationFeeCode(err.GetErrorCode()) {
 			return PolicyDecision{Action: "stop", Reason: "non_retryable_error", Source: "system"}
 		}
 		if retryTimes <= 0 {

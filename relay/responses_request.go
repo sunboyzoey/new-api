@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
+	openaichannel "github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -27,6 +28,7 @@ import (
 // The returned adaptor retains route/conversion state for DoRequest/DoResponse.
 func PrepareResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, req *dto.OpenAIResponsesRequest) (relaychannel.Adaptor, common.ReplayableBody, io.Closer, *types.NewAPIError) {
 	info.InitChannelMeta(c)
+	info.ResponsesExternalTool = false
 	if info.RelayMode == relayconstant.RelayModeResponsesCompact &&
 		!common.SupportsResponsesCompact(info.ChannelType, info.ApiType) {
 		return nil, nil, nil, types.NewErrorWithStatusCode(
@@ -108,6 +110,8 @@ func PrepareResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, req *d
 			return nil, nil, nil, newAPIErrorFromParamOverride(err)
 		}
 	}
+
+	info.ResponsesExternalTool = !openaichannel.ResponsesToolsReplaySafe(gjson.GetBytes(jsonData, "tools"))
 
 	// Param overrides must not forward a gateway alias to an upstream.
 	finalPrevious := gjson.GetBytes(jsonData, "previous_response_id").String()

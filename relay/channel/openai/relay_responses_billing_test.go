@@ -627,3 +627,67 @@ func TestManagedResponsesTerminalDisconnect(t *testing.T) {
 		})
 	}
 }
+
+func TestResponsesProgressiveAttemptDelivery(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	const partialText = "visible model text"
+	const delta = `{"type":"response.output_text.delta","delta":"` + partialText + `"}`
+	const usage = `"usage":{"input_tokens":23,"output_tokens":7}`
+	const failed = `{"type":"response.failed","response":{"status":"failed","error":{"type":"server_error","message":"upstream failed"},` + usage + `}}`
+	const completed = `{"type":"response.completed","response":{"status":"completed",` + usage + `}}`
+	const incomplete = `{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},` + usage + `}}`
+	const search = `{"type":"response.output_item.added","item":{"type":"web_search_call","id":"item_1"}}`
+	const external = `{"type":"response.output_item.added","item":{"type":"mcp_call","id":"item_2"}}`
+	for _, tc := range []struct {
+		name   string
+		events []string
+		tools  string
+		failed bool
+		retry  bool
+	}{
+		{"hosted search fails before visible text", []string{search, failed}, `[{"type":"namespace","tools":[{"type":"function"}]},{"type":"web_search"}]`, true, true},
+		{"unexpected external action blocks replay", []string{delta, external, failed}, "", true, false},
+		{"success releases original event sequence", []string{delta, search, completed}, "", false, false},
+		{"incomplete releases legitimate partial result", []string{delta, incomplete}, "", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			common.SetContextKey(c, constant.ContextKeyResponsesChannelFailover, true)
+			c.Set("responses_retry_managed", true)
+			info := &relaycommon.RelayInfo{
+				Request:               &dto.OpenAIResponsesRequest{Tools: []byte(tc.tools)},
+				ResponsesRetryManaged: true, DisablePing: true, ChannelMeta: &relaycommon.ChannelMeta{},
+			}
+			var stream strings.Builder
+			for _, event := range tc.events {
+				stream.WriteString("data: " + event + "\n\n")
+			}
+			usage, apiErr := OaiResponsesStreamHandler(c, info, &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(stream.String()))})
+			require.NotNil(t, usage)
+			assert.Equal(t, 30, usage.TotalTokens)
+			assert.Equal(t, tc.retry, common.GetContextKeyBool(c, constant.ContextKeyResponsesUpstreamRetryable))
+			if tc.failed {
+				require.NotNil(t, apiErr)
+				if tc.retry {
+					assert.Empty(t, recorder.Body.String(), "pre-text search activity is held until the attempt can answer")
+				} else {
+					assert.Contains(t, recorder.Body.String(), partialText)
+					assert.NotContains(t, recorder.Body.String(), "event: response.failed", "the router finalizes the error once")
+				}
+			} else {
+				require.Nil(t, apiErr)
+				var want strings.Builder
+				for _, event := range tc.events {
+					var decoded dto.ResponsesStreamResponse
+					require.NoError(t, common.UnmarshalJsonStr(event, &decoded))
+					want.WriteString("event: " + decoded.Type + "\ndata: " + event + "\n\n")
+				}
+				assert.Equal(t, want.String(), recorder.Body.String())
+			}
+		})
+	}
+}

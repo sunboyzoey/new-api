@@ -39,7 +39,7 @@ const (
 	FilterRequestPath        ChannelFilterKind = "request_path"
 	FilterTaskPluginIdentity ChannelFilterKind = "task_plugin_identity"
 	FilterResponsesWebSocket ChannelFilterKind = "responses_websocket"
-	FilterResponsesFailover  ChannelFilterKind = "responses_failover"
+	FilterRelayFailover      ChannelFilterKind = "relay_failover"
 )
 
 type ChannelFilter struct {
@@ -49,6 +49,7 @@ type ChannelFilter struct {
 	TaskPluginKeys         []string
 	TaskPluginChannelTypes []int
 	AttemptedChannelIDs    map[int]bool
+	NativeResponsesOnly    bool
 }
 
 type ChannelConstraints struct {

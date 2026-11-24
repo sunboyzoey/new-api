@@ -1,10 +1,14 @@
 package openai
 
 import (
+	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -70,19 +74,94 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	service.ApplyResponsesUsage(usage, responsesResponse.Usage)
 	observeNativeResponsesTools(info, responsesResponse.Output, responseBody)
 	if failure != nil {
-		if responsesFailureHasUsage(info, usage) {
+		if ResponsesRequestReplaySafe(info) && ResponsesHTTPFailureReplaySafe(responseBody) {
+			helper.MarkResponsesUpstreamFailure(c)
+		} else {
 			types.ErrOptionWithSkipRetry()(failure)
+		}
+		if responsesFailureHasUsage(info, usage) {
 			return usage, failure
 		}
-		if len(responsesResponse.Output) > 0 {
-			// An upstream tool can already have executed even without itemized usage.
-			types.ErrOptionWithSkipRetry()(failure)
-			return nil, failure
-		}
-		helper.MarkResponsesUpstreamFailure(c)
 		return nil, failure
 	}
 	return usage, nil
+}
+
+// ResponsesRequestReplaySafe excludes hosted tools that can mutate external
+// state even if their execution events never reach the gateway. Client tools
+// remain proposals until their calls are actually delivered.
+func ResponsesRequestReplaySafe(info *relaycommon.RelayInfo) bool {
+	if info.ResponsesExternalTool {
+		return false
+	}
+	req, ok := info.Request.(*dto.OpenAIResponsesRequest)
+	if !ok || req == nil || len(req.Tools) == 0 {
+		return true
+	}
+	return ResponsesToolsReplaySafe(gjson.ParseBytes(req.Tools))
+}
+
+// ResponsesToolsReplaySafe checks the tool declarations actually dispatched by a channel.
+func ResponsesToolsReplaySafe(tools gjson.Result) bool {
+	if tools.Type == gjson.Null {
+		return true
+	}
+	if !tools.IsArray() {
+		return false
+	}
+	for _, tool := range tools.Array() {
+		switch tool.Get("type").String() {
+		case "function", "custom", "web_search", "web_search_preview", "web_search_preview_2025_03_11", "file_search":
+		case "namespace":
+			// Namespaced tools remain client-dispatched when every member is a
+			// function or custom proposal. Check members before allowing replay.
+			members := tool.Get("tools")
+			if !members.IsArray() {
+				return false
+			}
+			for _, member := range members.Array() {
+				switch member.Get("type").String() {
+				case "function", "custom":
+				default:
+					return false
+				}
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func responsesOutputReplaySafe(kind string) bool {
+	switch kind {
+	case "message", "reasoning", "function_call", "custom_tool_call", "web_search_call", "file_search_call":
+		return true
+	default:
+		return false
+	}
+}
+
+// ResponsesHTTPFailureReplaySafe checks for accepted work still in progress,
+// completed results, or tools whose effects cannot be replayed across providers.
+func ResponsesHTTPFailureReplaySafe(body []byte) bool {
+	root := gjson.ParseBytes(body)
+	for _, payload := range []gjson.Result{root, root.Get("response")} {
+		switch payload.Get("status").String() {
+		case "completed", "queued", "in_progress", "incomplete":
+			return false
+		}
+		output := payload.Get("output")
+		if output.Exists() && output.Type != gjson.Null && !output.IsArray() {
+			return false
+		}
+		for _, item := range output.Array() {
+			if !responsesOutputReplaySafe(item.Get("type").String()) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // ResponsesHTTPFailureUsage checks whether an HTTP error envelope already
@@ -192,7 +271,10 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	managed := info.ResponsesRetryManaged
 	channelFailover := common.GetContextKeyBool(c, constant.ContextKeyResponsesChannelFailover)
 	upstreamFailure := false
-	upstreamOutput := false
+	replaySafe := !channelFailover || ResponsesRequestReplaySafe(info)
+	progressiveRetry := managed && channelFailover && replaySafe
+	var attemptFrames responsesAttemptFrames
+	defer attemptFrames.close()
 	var attemptError *types.NewAPIError
 	var pending []string
 	pendingBytes := 0
@@ -206,9 +288,14 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		}}
 	}
 
+	var continuation *responsesContinuation
+	if progressiveRetry {
+		continuation = beginResponsesContinuation(c, info)
+	}
+
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 
-		// 检查当前数据是否包含 completed 状态和 usage 信息
+		// Decode once before deciding whether this event can reach the client.
 		var streamResponse dto.ResponsesStreamResponse
 		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
 			logger.LogError(c, "failed to unmarshal stream response: "+err.Error())
@@ -234,9 +321,14 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			status := gjson.Get(data, "response.status").String()
 			failed := streamResponse.Type == "error" || streamResponse.Type == "response.error" || streamResponse.Type == "response.failed" || status == "failed"
 			cancelled := streamResponse.Type == "response.cancelled" || streamResponse.Type == "response.canceled" || status == "cancelled" || status == "canceled"
+			if progressiveRetry && replaySafe {
+				replaySafe = responsesEventReplaySafe(&streamResponse)
+			}
 			if failed || (channelFailover && cancelled) {
 				upstreamFailure = true
-				info.EarlyResponses.FailureEvent = data
+				if continuation == nil || !c.GetBool("responses_content_delivered") {
+					info.EarlyResponses.FailureEvent = data
+				}
 				rawError := gjson.Get(data, "response.error")
 				if !rawError.IsObject() {
 					rawError = gjson.Get(data, "error")
@@ -263,88 +355,173 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 					status = http.StatusBadRequest
 				}
 				attemptError = service.NormalizeResponsesRetryError(types.WithOpenAIError(wire, status))
-				// Observe authoritative usage even on a failed terminal. Explicit
-				// usage prevents replay and is settled by ResponsesHelper once.
+				// Keep failed-attempt usage independent of downstream delivery.
 				if channelFailover {
 					// Account for failures even when reported in a generic error
 					// frame that carries a terminal response.
 					streamResponse.Type = "response.failed"
-					upstreamOutput = streamResponse.Response != nil && len(streamResponse.Response.Output) > 0
 				}
 				accumulator.Observe(&streamResponse, common.StringToByteSlice(data))
 				sr.Stop(attemptError)
 				return
 			}
-			lifecycleOnly := (streamResponse.Type == "response.created" || streamResponse.Type == "response.in_progress") && len(gjson.Get(data, "response.output").Array()) == 0
-			lifecycleOnly = lifecycleOnly || (streamResponse.Type == "response.output_item.added" && gjson.Get(data, "item.type").String() == "message" && len(gjson.Get(data, "item.content").Array()) == 0)
-			lifecycleOnly = lifecycleOnly || (streamResponse.Type == "response.content_part.added" && gjson.Get(data, "part.type").String() == "output_text" && gjson.Get(data, "part.text").String() == "")
-			lifecycleOnly = lifecycleOnly || (streamResponse.Type == "response.output_text.delta" && streamResponse.Delta == "")
-			switch streamResponse.Type {
-			case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
-				"response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
-				"response.reasoning_text.delta", "response.reasoning_text.done":
-				lifecycleOnly = emptyReasoningPrelude(data, streamResponse.Type)
-			case dto.ResponsesOutputTypeItemAdded, dto.ResponsesOutputTypeItemDone:
-				if streamResponse.Item != nil && streamResponse.Item.Type == "reasoning" {
-					lifecycleOnly = emptyReasoningPrelude(data, streamResponse.Type)
-				}
-			}
-			if !forwarding && lifecycleOnly {
-				// A repeated numbered progress event with the exact same payload
-				// is a duplicate. Keep one copy and still refresh the public heartbeat.
-				fits := pendingBytes+len(data) <= 64<<10
-				duplicate := !fits && streamResponse.Type == "response.in_progress" && streamResponse.SequenceNumber != nil &&
-					streamResponse.Response != nil && streamResponse.Response.ID != "" && len(pending) > 0 && pending[len(pending)-1] == data
-				if fits || duplicate {
-					if streamResponse.Type == "response.in_progress" {
-						if err := helper.SendBufferedResponsesProgress(c, info); err != nil {
-							info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
-							attemptError = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
-							sr.Stop(err)
-							return
-						}
+			if progressiveRetry {
+				accumulator.Observe(&streamResponse, common.StringToByteSlice(data))
+				if !forwarding && info.StreamStatus.ResponseOutcome() == "" && !responsesHasReadableText(&streamResponse) && replaySafe {
+					if err := attemptFrames.append(data); err != nil {
+						upstreamFailure = true
+						attemptError = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusServiceUnavailable)
+						sr.Stop(err)
+						return
 					}
-					if !duplicate {
-						pending = append(pending, data)
-						pendingBytes += len(data)
+					if err := helper.SendBufferedResponsesProgress(c, info); err != nil {
+						info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
+						attemptError = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+						sr.Stop(err)
 					}
 					return
 				}
-			}
-			// Bound memory without rejecting valid large metadata. Once any
-			// attempt-specific frame is exposed, conservatively forbid replay.
-			if !forwarding {
-				reason := service.ResponsesCommitEvent
-				if lifecycleOnly {
-					reason = service.ResponsesCommitBufferLimit
+				if !forwarding {
+					// Publish the first human-readable event immediately. Only prior
+					// lifecycle and tool frames need to drain before it.
+					forwarding = true
+					err := attemptFrames.replay(func(frame string) error {
+						payload, emit, err := continuation.reconcile(frame)
+						if err != nil {
+							upstreamFailure = true
+							return err
+						}
+						if !emit {
+							return nil
+						}
+						service.MarkResponsesStreamCommit(c, &streamResponse, service.ResponsesCommitEvent, attemptFrames.size, len(data))
+						var event dto.ResponsesStreamResponse
+						if err := common.UnmarshalJsonStr(payload, &event); err != nil {
+							return err
+						}
+						typ, payload, err := helper.RewriteEarlyResponsesEvent(c, info, event, payload)
+						if err != nil {
+							return err
+						}
+						event.Type = typ
+						helper.ExtendWriteDeadline(c)
+						if err := helper.ResponseChunkData(c, event, payload); err != nil {
+							info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
+							return err
+						}
+						if info.EarlyResponses.SentAt.IsZero() {
+							if sequence := gjson.Get(payload, "sequence_number"); sequence.Exists() {
+								info.EarlyResponses.Sequence = int(sequence.Int()) + 1
+							} else {
+								info.EarlyResponses.Sequence++
+							}
+							if event.Response != nil {
+								_ = common.UnmarshalJsonStr(gjson.Get(payload, "response").Raw, &info.EarlyResponses.Response)
+							}
+						}
+						return nil
+					})
+					attemptFrames.close()
+					if err != nil {
+						attemptError = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusBadGateway)
+						sr.Stop(err)
+						return
+					}
 				}
-				service.MarkResponsesStreamCommit(c, &streamResponse, reason, pendingBytes, len(data))
-				forwarding = true
-			}
-			delivered = delivered || !lifecycleOnly
-			for _, buffered := range pending {
-				var event dto.ResponsesStreamResponse
-				_ = common.UnmarshalJsonStr(buffered, &event)
-				typ, rewritten, err := helper.RewriteEarlyResponsesEvent(c, info, event, buffered)
+				payload, emit, err := continuation.reconcile(data)
 				if err != nil {
+					upstreamFailure = true
 					attemptError = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusBadGateway)
 					sr.Stop(err)
 					return
 				}
-				event.Type = typ
-				if err := helper.ResponseChunkData(c, event, rewritten); err != nil {
-					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
-					attemptError = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+				if !emit {
+					return
+				}
+				data = payload
+				streamResponse = dto.ResponsesStreamResponse{}
+				if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
+					attemptError = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusBadGateway)
 					sr.Stop(err)
 					return
 				}
-				if info.EarlyResponses.SentAt.IsZero() && event.Response != nil {
-					_ = common.UnmarshalJsonStr(gjson.Get(buffered, "response").Raw, &info.EarlyResponses.Response)
-				}
+				service.MarkResponsesStreamCommit(c, &streamResponse, service.ResponsesCommitEvent, attemptFrames.size, len(data))
+				delivered = true
 			}
-			pending = nil
+			if !progressiveRetry {
+				lifecycleOnly := (streamResponse.Type == "response.created" || streamResponse.Type == "response.in_progress") && len(gjson.Get(data, "response.output").Array()) == 0
+				lifecycleOnly = lifecycleOnly || (streamResponse.Type == "response.output_item.added" && gjson.Get(data, "item.type").String() == "message" && len(gjson.Get(data, "item.content").Array()) == 0)
+				lifecycleOnly = lifecycleOnly || (streamResponse.Type == "response.content_part.added" && gjson.Get(data, "part.type").String() == "output_text" && gjson.Get(data, "part.text").String() == "")
+				lifecycleOnly = lifecycleOnly || (streamResponse.Type == "response.output_text.delta" && streamResponse.Delta == "")
+				switch streamResponse.Type {
+				case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
+					"response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
+					"response.reasoning_text.delta", "response.reasoning_text.done":
+					lifecycleOnly = emptyReasoningPrelude(data, streamResponse.Type)
+				case dto.ResponsesOutputTypeItemAdded, dto.ResponsesOutputTypeItemDone:
+					if streamResponse.Item != nil && streamResponse.Item.Type == "reasoning" {
+						lifecycleOnly = emptyReasoningPrelude(data, streamResponse.Type)
+					}
+				}
+				if !forwarding && lifecycleOnly {
+					// A repeated numbered progress event with the exact same payload
+					// is a duplicate. Keep one copy and still refresh the public heartbeat.
+					fits := pendingBytes+len(data) <= 64<<10
+					duplicate := !fits && streamResponse.Type == "response.in_progress" && streamResponse.SequenceNumber != nil &&
+						streamResponse.Response != nil && streamResponse.Response.ID != "" && len(pending) > 0 && pending[len(pending)-1] == data
+					if fits || duplicate {
+						if streamResponse.Type == "response.in_progress" {
+							if err := helper.SendBufferedResponsesProgress(c, info); err != nil {
+								info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
+								attemptError = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+								sr.Stop(err)
+								return
+							}
+						}
+						if !duplicate {
+							pending = append(pending, data)
+							pendingBytes += len(data)
+						}
+						return
+					}
+				}
+				// Bound memory without rejecting valid large metadata. Once any
+				// attempt-specific frame is exposed, conservatively forbid replay.
+				if !forwarding {
+					reason := service.ResponsesCommitEvent
+					if lifecycleOnly {
+						reason = service.ResponsesCommitBufferLimit
+					}
+					service.MarkResponsesStreamCommit(c, &streamResponse, reason, pendingBytes, len(data))
+					forwarding = true
+				}
+				delivered = delivered || !lifecycleOnly
+				for _, buffered := range pending {
+					var event dto.ResponsesStreamResponse
+					_ = common.UnmarshalJsonStr(buffered, &event)
+					typ, rewritten, err := helper.RewriteEarlyResponsesEvent(c, info, event, buffered)
+					if err != nil {
+						attemptError = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusBadGateway)
+						sr.Stop(err)
+						return
+					}
+					event.Type = typ
+					if err := helper.ResponseChunkData(c, event, rewritten); err != nil {
+						info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
+						attemptError = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+						sr.Stop(err)
+						return
+					}
+					if info.EarlyResponses.SentAt.IsZero() && event.Response != nil {
+						_ = common.UnmarshalJsonStr(gjson.Get(buffered, "response").Raw, &info.EarlyResponses.Response)
+					}
+				}
+				pending = nil
+			}
 		}
-		accumulator.Observe(&streamResponse, common.StringToByteSlice(data))
+		if !progressiveRetry {
+			accumulator.Observe(&streamResponse, common.StringToByteSlice(data))
+		}
 		if info.FirstTextTime.IsZero() {
 			hasText := streamResponse.Type == "response.output_text.delta" && streamResponse.Delta != ""
 			hasText = hasText || (streamResponse.Type == "response.output_text.done" && streamResponse.Text != nil && *streamResponse.Text != "")
@@ -370,12 +547,16 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		}
 		streamResponse.Type, data = eventType, rewritten
 		if managed && info.EarlyResponses.SentAt.IsZero() {
-			info.EarlyResponses.Sequence = int(gjson.Get(data, "sequence_number").Int()) + 1
+			if sequence := gjson.Get(data, "sequence_number"); sequence.Exists() {
+				info.EarlyResponses.Sequence = int(sequence.Int()) + 1
+			} else {
+				info.EarlyResponses.Sequence++
+			}
 			if streamResponse.Response != nil {
 				_ = common.UnmarshalJsonStr(gjson.Get(data, "response").Raw, &info.EarlyResponses.Response)
 			}
 		}
-		if (eventType == "response.completed" || eventType == "response.done") && info.ChannelMeta != nil && streamResponse.Response != nil && (info.EarlyResponses == nil || info.EarlyResponses.SentAt.IsZero()) {
+		if continuation == nil && (eventType == "response.completed" || eventType == "response.done") && info.ChannelMeta != nil && streamResponse.Response != nil && (info.EarlyResponses == nil || info.EarlyResponses.SentAt.IsZero()) {
 			service.RecordFallbackResponseOwner(c, info.ChannelId, streamResponse.Response.ID)
 		}
 		if err := helper.ResponseChunkData(c, streamResponse, data); err != nil {
@@ -419,17 +600,15 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			attemptError = service.NormalizeResponsesRetryError(attemptError)
 			info.StreamStatus.MarkFailed(string(attemptError.GetErrorCode()), attemptError.ToOpenAIError().Type, attemptError.StatusCode)
 			usage := accumulator.Finish()
-			if clientGone || forwarding {
+			if progressiveRetry && replaySafe && upstreamFailure && !clientGone && (!c.GetBool("responses_content_delivered") || continuation.canRetry()) {
+				helper.MarkResponsesUpstreamFailure(c)
+			} else if clientGone || forwarding || !replaySafe || delivered || responsesFailureHasUsage(info, usage) {
 				types.ErrOptionWithSkipRetry()(attemptError)
+			} else if upstreamFailure {
+				helper.MarkResponsesUpstreamFailure(c)
 			}
 			if delivered || responsesFailureHasUsage(info, usage) {
-				types.ErrOptionWithSkipRetry()(attemptError)
 				return usage, attemptError
-			}
-			if upstreamOutput {
-				types.ErrOptionWithSkipRetry()(attemptError)
-			} else if upstreamFailure && !clientGone && !forwarding {
-				helper.MarkResponsesUpstreamFailure(c)
 			}
 			return nil, attemptError
 		}
@@ -440,6 +619,150 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		_ = helper.FailEarlyResponses(c, info, types.NewOpenAIError(fmt.Errorf("upstream stream ended before a terminal event"), types.ErrorCodeBadResponse, http.StatusBadGateway))
 	}
 	return usage, nil
+}
+
+// Responses streams can place the first text on a delta, a part, an output
+// item or a response snapshot. Release each form at the same boundary.
+func responsesHasReadableText(event *dto.ResponsesStreamResponse) bool {
+	switch event.Type {
+	case "response.output_text.delta", "response.reasoning_text.delta", "response.reasoning_summary_text.delta",
+		"response.refusal.delta", "response.audio_transcript.delta":
+		return event.Delta != ""
+	case "response.output_text.done", "response.reasoning_text.done", "response.reasoning_summary_text.done",
+		"response.refusal.done", "response.audio_transcript.done":
+		return event.Text != nil && *event.Text != ""
+	}
+	if event.Part != nil && event.Part.Text != "" {
+		return true
+	}
+	hasText := func(item *dto.ResponsesOutput) bool {
+		for _, part := range item.Content {
+			if part.Text != "" {
+				return true
+			}
+		}
+		for _, part := range item.Summary {
+			if part.Text != "" {
+				return true
+			}
+		}
+		return false
+	}
+	if event.Item != nil && hasText(event.Item) {
+		return true
+	}
+	if event.Response != nil {
+		for i := range event.Response.Output {
+			if hasText(&event.Response.Output[i]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Unknown hosted actions may have side effects at the upstream even when the
+// gateway has not forwarded their events. Search is read-only, and private
+// client function calls have not been dispatched to a caller.
+func responsesEventReplaySafe(event *dto.ResponsesStreamResponse) bool {
+	if event.Item != nil && !responsesOutputReplaySafe(event.Item.Type) {
+		return false
+	}
+	if event.Response != nil {
+		for _, item := range event.Response.Output {
+			if !responsesOutputReplaySafe(item.Type) {
+				return false
+			}
+		}
+	}
+	switch event.Type {
+	case "error", "response.error", "response.queued", "response.created", "response.in_progress",
+		"response.failed", "response.cancelled", "response.canceled", "response.completed", "response.done", "response.incomplete",
+		"response.output_item.added", "response.output_item.done":
+		return true
+	}
+	for _, prefix := range []string{"response.output_text.", "response.content_part.", "response.reasoning_", "response.refusal.",
+		"response.function_call_arguments.", "response.custom_tool_call_input.", "response.web_search_call.", "response.file_search_call."} {
+		if strings.HasPrefix(event.Type, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// A stream scanner supplies one JSON line per frame. Spool large attempts in
+// mode-0600 cache files so a failed attempt can be discarded without exposing
+// its text, identifiers or tool calls.
+type responsesAttemptFrames struct {
+	size   int
+	memory bytes.Buffer
+	file   *os.File
+	writer *bufio.Writer
+}
+
+func (f *responsesAttemptFrames) append(data string) error {
+	const memoryLimit = 64 << 10
+	const totalLimit = 64 << 20
+	if len(data) >= totalLimit-f.size {
+		return fmt.Errorf("upstream response exceeded the %d-byte retry buffer", totalLimit)
+	}
+	f.size += len(data) + 1
+	if f.file == nil && f.size <= memoryLimit {
+		f.memory.WriteString(data)
+		f.memory.WriteByte('\n')
+		return nil
+	}
+	if f.file == nil {
+		_, file, err := common.CreateDiskCacheFile(common.DiskCacheTypeBody)
+		if err != nil {
+			return fmt.Errorf("could not allocate private response storage: %w", err)
+		}
+		f.file = file
+		f.writer = bufio.NewWriter(file)
+		if _, err := f.memory.WriteTo(f.writer); err != nil {
+			return fmt.Errorf("could not spool upstream response: %w", err)
+		}
+	}
+	if _, err := f.writer.WriteString(data); err != nil {
+		return fmt.Errorf("could not spool upstream response: %w", err)
+	}
+	return f.writer.WriteByte('\n')
+}
+
+func (f *responsesAttemptFrames) replay(deliver func(string) error) error {
+	var reader io.Reader = &f.memory
+	if f.file != nil {
+		if err := f.writer.Flush(); err != nil {
+			return err
+		}
+		if _, err := f.file.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		reader = f.file
+	}
+	lines := bufio.NewReader(reader)
+	for {
+		data, err := lines.ReadString('\n')
+		if err == io.EOF && len(data) == 0 {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := deliver(data[:len(data)-1]); err != nil {
+			return err
+		}
+	}
+}
+
+func (f *responsesAttemptFrames) close() {
+	if f.file != nil {
+		_ = f.file.Close()
+		_ = os.Remove(f.file.Name())
+		f.file = nil
+		f.writer = nil
+	}
+	f.memory = bytes.Buffer{}
 }
 
 // Keep only recognized, content-free reasoning frames private until an attempt

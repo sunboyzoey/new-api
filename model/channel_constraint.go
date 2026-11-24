@@ -13,7 +13,7 @@ var filterEvalOrder = []dto.ChannelFilterKind{
 	dto.FilterRequestPath,
 	dto.FilterTaskPluginIdentity,
 	dto.FilterResponsesWebSocket,
-	dto.FilterResponsesFailover,
+	dto.FilterRelayFailover,
 }
 
 // ChannelSatisfiesFilters reports whether ch passes every filter.
@@ -96,6 +96,13 @@ func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilte
 		if filter.RequestPath == "" {
 			return true
 		}
+		if filter.RequestPath == "/v1/alpha/search" {
+			switch ch.Type {
+			case constant.ChannelTypeCodex, constant.ChannelTypeSub2API, constant.ChannelTypeNewAPI, constant.ChannelTypeAdvancedCustom:
+			default:
+				return false
+			}
+		}
 		if !constant.IsAdvancedCustomChannel(ch.Type) {
 			return true
 		}
@@ -127,9 +134,12 @@ func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilte
 		default:
 			return false
 		}
-	case dto.FilterResponsesFailover:
+	case dto.FilterRelayFailover:
 		if filter.AttemptedChannelIDs[ch.Id] || ch.Status != common.ChannelStatusEnabled {
 			return false
+		}
+		if !filter.NativeResponsesOnly {
+			return true
 		}
 		apiType, _ := common.ChannelType2APIType(ch.Type)
 		var custom *kitdto.AdvancedCustomConfig

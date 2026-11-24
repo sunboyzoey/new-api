@@ -1367,9 +1367,9 @@ func TestManagedResponsesHTTPFailure(t *testing.T) {
 		}{
 			{502, "upstream_unavailable", "server_error", true},
 			{429, "rate_limit_exceeded", "rate_limit_error", true},
-			{400, "thinking_signature_invalid", "invalid_request_error", false},
-			{401, "invalid_api_key", "authentication_error", false},
-			{403, "access_denied", "server_error", false},
+			{400, "thinking_signature_invalid", "invalid_request_error", true},
+			{401, "invalid_api_key", "authentication_error", true},
+			{403, "access_denied", "server_error", true},
 		} {
 			t.Run(fmt.Sprintf("ack_%v/status_%d", ack, tc.status), func(t *testing.T) {
 				operation_setting.GetGeneralSetting().ResponsesEarlyAckEnabled = ack
@@ -1806,6 +1806,8 @@ func TestNativeAdvancedResponsesUpstreamFailover(t *testing.T) {
 		{name: "upstream EOF", status: 200, body: created, stream: true, retry: true},
 		{name: "upstream cancel", status: 200, body: "data: " + `{"type":"response.cancelled","response":{"status":"cancelled","output":[]}}` + "\n\n", stream: true, retry: true},
 		{name: "nonstream failed 200", status: 200, body: `{"status":"failed","error":{"code":"bad_credentials","message":"upstream denied"}}`, retry: true},
+		{name: "nonstream failed after private reasoning", status: 200, body: `{"status":"failed","output":[{"type":"reasoning","summary":[]}],"usage":{"input_tokens":7,"output_tokens":3}}`, retry: true},
+		{name: "HTTP failure after read-only search", status: 502, body: `{"error":{"code":"server_error","message":"search failed"},"response":{"status":"failed","output":[{"type":"web_search_call","id":"ws_1"}],"usage":{"input_tokens":7,"output_tokens":3}}}`, retry: true},
 		{name: "HTTP failure after tool execution", status: 403, body: `{"error":{"type":"invalid_request_error","message":"failed"},"response":{"output":[{"type":"mcp_call","status":"completed"}]}}`},
 		{name: "nonstream failed after tool execution", status: 200, body: `{"status":"failed","output":[{"type":"mcp_call","status":"completed"}]}`},
 		{name: "stream received failed JSON", stream: true, mime: "application/json", status: 200, body: `{"status":"failed","error":{"code":"invalid_api_key"}}`, retry: true},
@@ -1865,7 +1867,7 @@ func TestResponsesChannelFailoverAfterUpstreamWork(t *testing.T) {
 		name        string
 		text, usage bool
 	}{
-		{"text already delivered", true, false},
+		{"visible text retains an exact prefix", true, false},
 		{"usage in generic error event", false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1889,7 +1891,9 @@ func TestResponsesChannelFailoverAfterUpstreamWork(t *testing.T) {
 			require.NotNil(t, err)
 			require.NotNil(t, observed)
 			if tc.text {
-				assert.Contains(t, recorder.Body.String(), "already seen")
+				assert.Contains(t, recorder.Body.String(), "already seen", "real upstream text is delivered before failure")
+			} else {
+				assert.False(t, c.Writer.Written(), "failed private usage does not commit the response")
 			}
 			if tc.usage {
 				assert.Equal(t, 10, observed.TotalTokens)
@@ -1907,8 +1911,9 @@ func TestResponsesChannelFailoverAfterUpstreamWork(t *testing.T) {
 				assert.Equal(t, 1, info.ResponsesUsageInfo.BuiltInTools[dto.BuildInToolFileSearch].CallCount)
 
 			}
-			assert.False(t, common.GetContextKeyBool(c, constant.ContextKeyResponsesUpstreamRetryable))
-			assert.Equal(t, "stop", service.DecideRelayRetry(c, err, 1).Action)
+			assert.True(t, common.GetContextKeyBool(c, constant.ContextKeyResponsesUpstreamRetryable))
+			assert.Equal(t, "retry", service.DecideRelayRetry(c, err, 1).Action)
+			assert.Equal(t, "stop", service.DecideRelayRetry(c, err, 0).Action)
 		})
 	}
 }

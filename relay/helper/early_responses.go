@@ -20,14 +20,14 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-// MarkResponsesUpstreamFailure makes a pre-delivery upstream failure eligible
-// for the native channel failover policy. Callers must first exclude observed
-// usage, tool execution, and local processing errors.
+// MarkResponsesUpstreamFailure allows another native channel before delivery
+// or while a managed Responses handler can verify the published prefix.
 func MarkResponsesUpstreamFailure(c *gin.Context) {
-	if !common.GetContextKeyBool(c, constant.ContextKeyResponsesChannelFailover) || c.Request.Context().Err() != nil || c.GetBool("responses_content_delivered") {
+	prefixRecovery := c.GetBool("responses_retry_managed") && common.GetContextKeyBool(c, constant.ContextKeyResponsesPrefixRecovery)
+	if !common.GetContextKeyBool(c, constant.ContextKeyResponsesChannelFailover) || c.Request.Context().Err() != nil || (c.GetBool("responses_content_delivered") && !prefixRecovery) {
 		return
 	}
-	if c.Writer.Written() && !(c.GetBool("responses_retry_managed") && c.GetBool("responses_early_ack_committed")) {
+	if c.Writer.Written() && !prefixRecovery && !(c.GetBool("responses_retry_managed") && c.GetBool("responses_early_ack_committed")) {
 		return
 	}
 	common.SetContextKey(c, constant.ContextKeyResponsesUpstreamRetryable, true)
@@ -37,9 +37,10 @@ func MarkResponsesUpstreamFailure(c *gin.Context) {
 // protocol. Tools, structured output and history are forwarded unchanged.
 func PrepareEarlyResponses(info *relaycommon.RelayInfo, body common.ReplayableBody) {
 	info.EarlyResponses.Stop()
-	if info.ResponsesRetryManaged && info.EarlyResponses != nil && !info.EarlyResponses.SentAt.IsZero() {
-		// Keep the single public lifecycle across pre-content channel attempts.
-		info.EarlyResponses.FirstEvent = false
+	if info.ResponsesRetryManaged && info.EarlyResponses != nil && (info.EarlyResponses.FirstEvent || !info.EarlyResponses.SentAt.IsZero()) {
+		// Keep an upstream-first response public across attempts too. Only a
+		// previously acknowledged lifecycle may produce synthetic progress.
+		info.EarlyResponses.FirstEvent = info.EarlyResponses.SentAt.IsZero()
 		info.EarlyResponses.UpstreamID = ""
 		info.EarlyResponses.FailureEvent = ""
 		return
@@ -158,7 +159,7 @@ func SendEarlyResponsesAck(c *gin.Context, info *relaycommon.RelayInfo) error {
 // It does not bind the public response to an attempt or commit retryable content.
 func SendBufferedResponsesProgress(c *gin.Context, info *relaycommon.RelayInfo) error {
 	state := info.EarlyResponses
-	if state == nil || state.Chat || state.Finished || state.FirstEvent || state.SentAt.IsZero() {
+	if state == nil || state.Chat || state.Finished || state.FirstEvent || state.SentAt.IsZero() || c.GetBool("responses_content_delivered") {
 		return nil
 	}
 	last := state.LastProgressAt
@@ -206,11 +207,15 @@ func RewriteEarlyResponsesEvent(c *gin.Context, info *relaycommon.RelayInfo, eve
 		if !state.SentAt.IsZero() {
 			if event.Response != nil && event.Response.ID != "" {
 				if state.UpstreamID == "" {
-					if err := service.SaveEarlyResponseAlias(info.UserId, info.ChannelId, state.ID, event.Response.ID); err != nil {
-						return "", "", err
-					}
-					if err := service.SaveFallbackResponseOwner(c, info.ChannelId, state.ID, event.Response.ID); err != nil {
-						return "", "", err
+					// A progressive response can change channels after publication.
+					// Its continuation records the winning owner at the terminal.
+					if _, guarded := c.Get(string(constant.ContextKeyResponsesPublicPrefix)); !guarded {
+						if err := service.SaveEarlyResponseAlias(info.UserId, info.ChannelId, state.ID, event.Response.ID); err != nil {
+							return "", "", err
+						}
+						if err := service.SaveFallbackResponseOwner(c, info.ChannelId, state.ID, event.Response.ID); err != nil {
+							return "", "", err
+						}
 					}
 					state.UpstreamID = event.Response.ID
 				} else if event.Response.ID != state.UpstreamID {
@@ -300,7 +305,8 @@ func FailEarlyResponses(c *gin.Context, info *relaycommon.RelayInfo, apiErr *typ
 		response[key] = value
 	}
 	envelope := map[string]any{}
-	if state.FailureEvent != "" {
+	guardedPrefix := common.GetContextKeyBool(c, constant.ContextKeyResponsesPrefixRecovery) && c.GetBool("responses_content_delivered")
+	if state.FailureEvent != "" && !guardedPrefix {
 		_ = common.UnmarshalJsonStr(state.FailureEvent, &envelope)
 		if upstream, ok := envelope["response"].(map[string]any); ok {
 			for key, value := range upstream {

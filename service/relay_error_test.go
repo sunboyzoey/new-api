@@ -164,6 +164,20 @@ func TestDecideRelayRetryReasons(t *testing.T) {
 	}
 }
 
+func TestHTTPModelRelayUsesAnotherChannelForUpstreamErrors(t *testing.T) {
+	for _, status := range []int{400, 408, 502, 504, 524} {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		common.SetContextKey(c, constant.ContextKeyModelChannelFailover, true)
+		c.Set(ginKeyChannelAffinitySkipRetry, true)
+		err := types.NewOpenAIError(errors.New("upstream"), types.ErrorCodeBadResponseStatusCode, status)
+		assert.Equal(t, "retry", DecideRelayRetry(c, err, 1).Action)
+		assert.Equal(t, "attempt_budget_exhausted", DecideRelayRetry(c, err, 0).Reason)
+		c.Writer.WriteHeaderNow()
+		assert.Equal(t, "response_committed", DecideRelayRetry(c, err, 1).Reason)
+	}
+}
+
 func TestResponsesFailoverPreservesRoutingConstraints(t *testing.T) {
 	upstream := types.WithOpenAIError(types.OpenAIError{Code: "invalid_api_key"}, http.StatusUnauthorized, types.ErrOptionWithSkipRetry())
 	for _, tc := range []struct {

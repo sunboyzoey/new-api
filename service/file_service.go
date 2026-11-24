@@ -167,8 +167,13 @@ func loadFromURL(c *gin.Context, url string, reason ...string) (*types.CachedFil
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("failed to download file, status code: %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		err := fmt.Errorf("failed to download file, status code: %d", resp.StatusCode)
+		switch resp.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusGone:
+			return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+		}
+		return nil, err
 	}
 
 	// 读取文件内容（限制大小）

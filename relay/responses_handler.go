@@ -8,6 +8,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	openaichannel "github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -60,8 +61,14 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 	nativeResponses := info.RelayMode == relayconstant.RelayModeResponses &&
 		info.RelayFormat == types.RelayFormatOpenAIResponses &&
 		model.SupportsManagedResponses(info.ChannelType, info.ApiType, info.ChannelOtherSettings.AdvancedCustom, c.Request.URL.Path, info.OriginModelName)
-	if nativeResponses && info.ChannelType == constant.ChannelTypeAdvancedCustom && (!info.IsStream || info.ResponsesRetryManaged) {
+	if nativeResponses && (!info.IsStream || info.ResponsesRetryManaged) {
 		common.SetContextKey(c, constant.ContextKeyResponsesChannelFailover, true)
+	}
+	if common.GetContextKeyBool(c, constant.ContextKeyResponsesPrefixRecovery) && !openaichannel.ResponsesRequestReplaySafe(info) {
+		// No bytes have been sent to this alternate. Another compatible
+		// candidate can still resume the already public stream.
+		helper.MarkResponsesUpstreamFailure(c)
+		return types.NewOpenAIError(fmt.Errorf("channel tools cannot safely resume the response"), types.ErrorCodeBadResponse, http.StatusBadGateway)
 	}
 	if info.ResponsesRetryManaged {
 		if !nativeResponses {
@@ -76,6 +83,30 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 		if info.ResponsesRetryManaged {
 			c.Set("responses_retry_managed", true)
 		}
+	}
+	if nativeResponses && common.GetContextKeyBool(c, constant.ContextKeyResponsesChannelFailover) {
+		// A discarded attempt can report real tool usage. Keep its counts out
+		// of the next channel's user settlement, including per-image pricing.
+		originalTools := info.ResponsesUsageInfo
+		if originalTools != nil {
+			tools := make(map[string]*relaycommon.BuildInToolInfo, len(originalTools.BuiltInTools))
+			for name, tool := range originalTools.BuiltInTools {
+				if tool != nil {
+					value := *tool
+					tools[name] = &value
+				}
+			}
+			info.ResponsesUsageInfo = &relaycommon.ResponsesUsageInfo{BuiltInTools: tools}
+		}
+		imageCount := info.BillingImageCount
+		ratios := info.PriceData.OtherRatios()
+		defer func() {
+			if newAPIError != nil && common.GetContextKeyBool(c, constant.ContextKeyResponsesUpstreamRetryable) {
+				info.ResponsesUsageInfo = originalTools
+				info.BillingImageCount = imageCount
+				info.PriceData.ReplaceOtherRatios(ratios)
+			}
+		}()
 	}
 	helper.PrepareEarlyResponses(info, requestBody)
 	defer func() {
@@ -92,6 +123,13 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 	var httpResp *http.Response
 	resp, err := adaptor.DoRequest(c, info, requestBody)
 	if err != nil {
+		if nativeResponses {
+			if openaichannel.ResponsesRequestReplaySafe(info) {
+				helper.MarkResponsesUpstreamFailure(c)
+			} else {
+				common.SetContextKey(c, constant.ContextKeyResponsesUpstreamRetryable, false)
+			}
+		}
 		return types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
 	}
 
@@ -129,7 +167,7 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 				} else {
 					handleResponsesHTTPFailure(c, info, newAPIError, body)
 				}
-			} else {
+			} else if openaichannel.ResponsesRequestReplaySafe(info) {
 				helper.MarkResponsesUpstreamFailure(c)
 			}
 		}
@@ -139,11 +177,8 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 	usage, newAPIError := adaptor.DoResponse(c, httpResp, info)
 	if newAPIError != nil {
 		if info.ResponsesRetryManaged || (nativeResponses && common.GetContextKeyBool(c, constant.ContextKeyResponsesChannelFailover)) {
-			// Delivered output and observed upstream usage settle once; the
-			// router must never replay an attempt after either boundary.
 			if observed, ok := usage.(*dto.Usage); ok && observed != nil {
-				ConsumeResponsesQuota(c, info, observed)
-				types.ErrOptionWithSkipRetry()(newAPIError)
+				settleResponsesAttemptFailure(c, info, newAPIError, observed)
 			}
 		}
 		// reset status code 重置状态码
@@ -175,14 +210,25 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 
 func handleResponsesHTTPFailure(c *gin.Context, info *relaycommon.RelayInfo, apiErr *types.NewAPIError, body []byte) {
 	usage, observedWork := openaichannel.ResponsesHTTPFailureUsage(info, body)
-	if observedWork {
-		if usage != nil {
-			ConsumeResponsesQuota(c, info, usage)
-		}
+	if !observedWork || (openaichannel.ResponsesHTTPFailureReplaySafe(body) && openaichannel.ResponsesRequestReplaySafe(info)) {
+		helper.MarkResponsesUpstreamFailure(c)
+	}
+	if usage != nil {
+		settleResponsesAttemptFailure(c, info, apiErr, usage)
+	} else if observedWork && !common.GetContextKeyBool(c, constant.ContextKeyResponsesUpstreamRetryable) {
 		types.ErrOptionWithSkipRetry()(apiErr)
+	}
+}
+
+// A replayable failure is provider work without a delivered response. Record
+// the attempt separately and leave the reservation for the winning channel.
+func settleResponsesAttemptFailure(c *gin.Context, info *relaycommon.RelayInfo, apiErr *types.NewAPIError, usage *dto.Usage) {
+	if common.GetContextKeyBool(c, constant.ContextKeyResponsesUpstreamRetryable) {
+		logger.LogInfo(c, fmt.Sprintf("discarded Responses attempt: channel=%d input_tokens=%d output_tokens=%d", info.ChannelId, usage.PromptTokens, usage.CompletionTokens))
 		return
 	}
-	helper.MarkResponsesUpstreamFailure(c)
+	ConsumeResponsesQuota(c, info, usage)
+	types.ErrOptionWithSkipRetry()(apiErr)
 }
 
 // ConsumeResponsesQuota applies the same settlement dispatch to HTTP and

@@ -96,6 +96,8 @@ type RelayInfo struct {
 	FirstTextTime  time.Time
 	// ResponsesRetryManaged lets the router own final failure emission.
 	ResponsesRetryManaged bool
+	// ResponsesExternalTool marks an effective outbound tool that can change external state.
+	ResponsesExternalTool bool
 	ResponsePreviousAlias string
 	isFirstResponse       bool
 	//SendLastReasoningResponse bool

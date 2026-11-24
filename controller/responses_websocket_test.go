@@ -886,6 +886,24 @@ func persistedResponsesCommit(t *testing.T, entry model.Log) map[string]any {
 	return detail.Admin.Commit
 }
 
+// The response alias cache retains its Redis client for the life of the process.
+// Each HTTP subtest needs an independent client for its own temporary server.
+func runResponsesAliasFixtureInChild(t *testing.T) bool {
+	t.Helper()
+	if os.Getenv("TEST_RESPONSES_REPLAY_CHILD") == t.Name() {
+		return false
+	}
+	parts := strings.Split(t.Name(), "/")
+	for i := range parts {
+		parts[i] = "^" + regexp.QuoteMeta(parts[i]) + "$"
+	}
+	cmd := exec.Command(os.Args[0], "-test.run="+strings.Join(parts, "/"), "-test.count=1", "-test.v")
+	cmd.Env = append(os.Environ(), "TEST_RESPONSES_REPLAY_CHILD="+t.Name())
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, "%s", output)
+	return true
+}
+
 func TestResponsesStreamOutcomesPreserveAccounting(t *testing.T) {
 	beforeErrorLogs := constant.ErrorLogEnabled
 	constant.ErrorLogEnabled = true
@@ -910,6 +928,9 @@ func TestResponsesStreamOutcomesPreserveAccounting(t *testing.T) {
 			{name: "completed-zero-fixed", expression: `tier("request", fixed(0.002))`, terminal: `{"type":"response.completed","response":{"id":"first","status":"completed","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`},
 		} {
 			t.Run(transport+"/"+tc.name, func(t *testing.T) {
+				if transport == "http-sse" && runResponsesAliasFixtureInChild(t) {
+					return
+				}
 				events := []string{`{"type":"response.created","response":{"id":"first","status":"in_progress"}}`}
 				if tc.delta {
 					events = append(events, `{"type":"response.output_text.delta","delta":"hello"}`)
@@ -946,8 +967,7 @@ func TestResponsesStreamOutcomesPreserveAccounting(t *testing.T) {
 				setting.ModelRequestRateLimitDurationMinutes = 1
 				setting.ModelRequestRateLimitSuccessCount = 1
 				setting.ModelRequestRateLimitCount = 0
-				rejected := transport == "http-sse" && tc.failed && !tc.delta
-				uncharged := rejected && tc.name != "failed-actual-usage"
+				uncharged := transport == "http-sse" && tc.failed
 				if transport == "http-sse" {
 					request, err := http.NewRequest(http.MethodPost, fixture.gatewayURL+"/v1/responses", strings.NewReader(`{"model":"ws-billing","input":"hi","stream":true,"max_output_tokens":1}`))
 					require.NoError(t, err)
@@ -958,7 +978,12 @@ func TestResponsesStreamOutcomesPreserveAccounting(t *testing.T) {
 					body, err := io.ReadAll(response.Body)
 					require.NoError(t, err)
 					require.NoError(t, response.Body.Close())
-					if rejected {
+					if tc.failed && tc.delta {
+						assert.Equal(t, http.StatusOK, response.StatusCode)
+						assert.Equal(t, 1, strings.Count(string(body), `"delta":"hello"`))
+						assert.Equal(t, 1, strings.Count(string(body), "event: response.failed"))
+						assert.NotContains(t, string(body), "event: response.completed")
+					} else if uncharged {
 						status, code := http.StatusBadGateway, "server_error"
 						if tc.ignored {
 							status, code = http.StatusBadRequest, "context_length_exceeded"
@@ -969,16 +994,10 @@ func TestResponsesStreamOutcomesPreserveAccounting(t *testing.T) {
 						require.NoError(t, common.Unmarshal(body, &failure))
 						assert.Equal(t, code, failure.Error.Code)
 						assert.NotContains(t, string(body), "response.created")
+						assert.NotContains(t, string(body), "hello")
 					} else {
 						assert.Equal(t, http.StatusOK, response.StatusCode)
-						if tc.failed {
-							assert.Contains(t, string(body), "event: response.failed")
-							assert.Contains(t, string(body), "server_error")
-							assert.Equal(t, 1, strings.Count(string(body), "hello"))
-							assert.NotContains(t, string(body), "[DONE]")
-						} else {
-							assert.Contains(t, string(body), terminal)
-						}
+						assert.Contains(t, string(body), terminal)
 					}
 				} else {
 					require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","stream_id":"planner","model":"ws-billing","input":"hi","max_output_tokens":1}`)))
@@ -1000,7 +1019,7 @@ func TestResponsesStreamOutcomesPreserveAccounting(t *testing.T) {
 							assert.Equal(t, "response.output_text.delta", commit["event_type"])
 							assert.Equal(t, true, commit["has_output_text"])
 						} else {
-							assert.Nil(t, commit, "a rejected attempt never forwarded channel-specific content")
+							assert.Nil(t, commit, "a pre-text failure never published channel-specific output")
 						}
 					}
 				} else {
@@ -1059,6 +1078,11 @@ func TestResponsesStreamOutcomesPreserveAccounting(t *testing.T) {
 
 func TestResponsesHTTPHealthCountsFinalResult(t *testing.T) {
 	const emptySummary = `data: {"type":"response.reasoning_summary_part.added","sequence_number":2,"item_id":"discarded_summary","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}` + "\n\n"
+	const searchBeforeFailure = `data: {"type":"response.output_item.added","item":{"id":"discarded_search","type":"web_search_call","status":"in_progress"},"output_index":0}
+
+data: {"type":"response.failed","response":{"id":"discarded","status":"failed","usage":{"input_tokens":90,"output_tokens":9,"total_tokens":99},"error":{"type":"server_error","code":"server_error","message":"discarded failure"}}}
+
+`
 	previousErrorLog := constant.ErrorLogEnabled
 	constant.ErrorLogEnabled = true
 	t.Cleanup(func() { constant.ErrorLogEnabled = previousErrorLog })
@@ -1072,10 +1096,18 @@ func TestResponsesHTTPHealthCountsFinalResult(t *testing.T) {
 		ignored               bool
 		stream, ack           bool
 		advanced, cancel      bool
+		search                bool
+		backupPrefix          string
 	}{
 		{name: "CPA queue timeout after ack", advanced: true, code: "bps_queue_timeout", firstStatus: 503, attempts: 2, success: true, stream: true, ack: true},
 		{name: "CPA SSE overload after ack", advanced: true, code: "overloaded_error", firstStatus: 502, attempts: 2, success: true, stream: true, ack: true},
 		{name: "CPA empty reasoning summary before failure", advanced: true, firstEvent: emptySummary + readFailure, firstStatus: 502, attempts: 2, success: true, stream: true, ack: true},
+		{name: "CPA search and usage before first text", advanced: true, search: true, firstEvent: searchBeforeFailure, firstStatus: 502, attempts: 2, success: true, stream: true, ack: true},
+		{name: "first text before terminal and matching fallback", advanced: true, backupPrefix: "visible prefix", firstEvent: readFailure, firstStatus: 502, attempts: 2, success: true, stream: true, ack: true},
+		{name: "matching fallback preserves unacknowledged response ID", advanced: true, backupPrefix: "visible prefix", firstEvent: readFailure, firstStatus: 502, attempts: 2, success: true, stream: true},
+		{name: "diverging fallback without early ack", advanced: true, backupPrefix: "conflicting answer", firstEvent: readFailure, firstStatus: 502, attempts: 2, stream: true},
+		{name: "first text before terminal and diverging fallback", advanced: true, backupPrefix: "conflicting answer", firstEvent: readFailure, firstStatus: 502, attempts: 2, stream: true, ack: true},
+		{name: "unique channel with interrupted stream", firstEvent: readFailure, firstStatus: 502, attempts: 1, stream: true, ack: true},
 		{name: "CPA upstream unauthorized", advanced: true, code: "invalid_api_key", firstStatus: 401, attempts: 2, success: true},
 		{name: "CPA client cancellation after ack", advanced: true, cancel: true, stream: true, ack: true, attempts: 1},
 		{name: "business rejection", code: "context_length_exceeded", firstStatus: 400, attempts: 1, ignored: true},
@@ -1093,18 +1125,7 @@ func TestResponsesHTTPHealthCountsFinalResult(t *testing.T) {
 		{name: "SSE rate limit fallback", code: "rate_limit_exceeded", firstStatus: 429, attempts: 2, success: true, stream: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// The alias cache captures its Redis client once per process.
-			// Give acknowledgment cases a complete process lifetime instead
-			// of reusing a client closed by an earlier fixture.
-			if tc.ack && os.Getenv("TEST_RESPONSES_REPLAY_CHILD") != t.Name() {
-				parts := strings.Split(t.Name(), "/")
-				for i := range parts {
-					parts[i] = "^" + regexp.QuoteMeta(parts[i]) + "$"
-				}
-				cmd := exec.Command(os.Args[0], "-test.run="+strings.Join(parts, "/"), "-test.count=1", "-test.v")
-				cmd.Env = append(os.Environ(), "TEST_RESPONSES_REPLAY_CHILD="+t.Name())
-				output, err := cmd.CombinedOutput()
-				require.NoError(t, err, "%s", output)
+			if runResponsesAliasFixtureInChild(t) {
 				return
 			}
 			fixture := newResponsesWSBillingTest(t, `tier("request", fixed(0.002))`, func(*websocket.Conn, *http.Request) {})
@@ -1121,6 +1142,14 @@ func TestResponsesHTTPHealthCountsFinalResult(t *testing.T) {
 			var releaseOnce sync.Once
 			unblock := func() { releaseOnce.Do(func() { close(release) }) }
 			defer unblock()
+			allowTerminal := make(chan struct{})
+			textItem := func(id string) string {
+				return fmt.Sprintf("data: "+`{"type":"response.output_item.added","output_index":0,"item":{"id":"%s","type":"message","role":"assistant","content":[]}}`+"\n\n", id) +
+					fmt.Sprintf("data: "+`{"type":"response.content_part.added","output_index":0,"item_id":"%s","content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}`+"\n\n", id)
+			}
+			textDelta := func(itemID, delta string) string {
+				return fmt.Sprintf("data: "+`{"type":"response.output_text.delta","item_id":"%s","output_index":0,"content_index":0,"delta":"%s"}`+"\n\n", itemID, delta)
+			}
 			var attempts atomic.Int64
 			firstStarted := make(chan struct{})
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1128,8 +1157,8 @@ func TestResponsesHTTPHealthCountsFinalResult(t *testing.T) {
 				if attempt == 1 {
 					close(firstStarted)
 				}
-				if tc.advanced {
-					assert.Equal(t, attempt == 1, r.Header.Get("Authorization") == "Bearer test-cpa", "fallback must use a different channel")
+				if tc.advanced || tc.attempts == 2 {
+					assert.Equal(t, attempt == 1, r.Header.Get("Authorization") == "Bearer test-primary", "each distinct channel must be attempted only once")
 				}
 				if tc.ack && attempt == 1 {
 					select {
@@ -1147,6 +1176,15 @@ func TestResponsesHTTPHealthCountsFinalResult(t *testing.T) {
 							w.Header().Set("Content-Length", "65536")
 						}
 						_, _ = io.WriteString(w, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"discarded\",\"output\":[]}}\n\n")
+						if tc.backupPrefix != "" {
+							_, _ = io.WriteString(w, textItem("msg_A")+textDelta("msg_A", "visible prefix"))
+							w.(http.Flusher).Flush()
+							select {
+							case <-allowTerminal:
+							case <-r.Context().Done():
+								return
+							}
+						}
 						if tc.firstEvent != "" {
 							_, _ = io.WriteString(w, tc.firstEvent)
 						} else if tc.code != "" {
@@ -1154,7 +1192,12 @@ func TestResponsesHTTPHealthCountsFinalResult(t *testing.T) {
 						}
 						return
 					}
-					_, _ = io.WriteString(w, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"winner\",\"output\":[]}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"winner\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":1,\"total_tokens\":1001}}}\n\n")
+					_, _ = io.WriteString(w, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"winner\",\"output\":[]}}\n\n")
+					if tc.backupPrefix != "" {
+						_, _ = io.WriteString(w, textItem("msg_B")+textDelta("msg_B", tc.backupPrefix))
+						_, _ = io.WriteString(w, textDelta("msg_B", "unique suffix"))
+					}
+					_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"winner\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":1,\"total_tokens\":1001}}}\n\n")
 					return
 				}
 				w.Header().Set("Content-Type", "application/json")
@@ -1167,26 +1210,49 @@ func TestResponsesHTTPHealthCountsFinalResult(t *testing.T) {
 			}))
 			t.Cleanup(upstream.Close)
 			require.NoError(t, model.DB.Model(&model.Channel{}).Where("name = ?", "responses-ws-upstream").Update("base_url", upstream.URL).Error)
-			if tc.advanced {
-				cpa := &model.Channel{Name: "responses-cpa", Key: "test-cpa", Status: common.ChannelStatusEnabled, Type: constant.ChannelTypeAdvancedCustom, Group: "default", Models: "ws-billing", BaseURL: &upstream.URL, Priority: common.GetPointer(int64(5))}
-				cpa.SetOtherSettings(dto.ChannelOtherSettings{AdvancedCustom: &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{{IncomingPath: "/v1/responses", UpstreamPath: "/v1/responses"}}}})
-				require.NoError(t, cpa.Insert())
+			firstChannelID := fixture.channel.Id
+			if tc.advanced || tc.attempts == 2 {
+				primary := &model.Channel{Name: "responses-primary", Key: "test-primary", Status: common.ChannelStatusEnabled, Type: constant.ChannelTypeOpenAI, Group: "default", Models: "ws-billing", BaseURL: &upstream.URL, Priority: common.GetPointer(int64(5))}
+				if tc.advanced {
+					primary.Type = constant.ChannelTypeAdvancedCustom
+					primary.SetOtherSettings(dto.ChannelOtherSettings{AdvancedCustom: &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{{IncomingPath: "/v1/responses", UpstreamPath: "/v1/responses"}}}})
+				}
+				require.NoError(t, primary.Insert())
+				firstChannelID = primary.Id
 				t.Cleanup(func() {
-					require.NoError(t, model.DB.Where("channel_id = ?", cpa.Id).Delete(&model.Ability{}).Error)
-					require.NoError(t, model.DB.Delete(cpa).Error)
+					require.NoError(t, model.DB.Where("channel_id = ?", primary.Id).Delete(&model.Ability{}).Error)
+					require.NoError(t, model.DB.Delete(primary).Error)
 				})
 			}
-			requestJSON := fmt.Sprintf("{\"model\":\"ws-billing\",\"input\":\"hello\",\"stream\":%t}", tc.stream)
+			requestJSON := fmt.Sprintf(`{"model":"ws-billing","input":"hello","stream":%t}`, tc.stream)
+			if tc.search {
+				requestJSON = `{"model":"ws-billing","input":"hello","stream":true,"tools":[{"type":"web_search"}]}`
+			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			request, err := http.NewRequestWithContext(ctx, http.MethodPost, fixture.gatewayURL+"/v1/responses", strings.NewReader(requestJSON))
 			require.NoError(t, err)
 			request.Header.Set("Authorization", "Bearer sk-"+fixture.token.Key)
 			request.Header.Set("Content-Type", "application/json")
+			requestStarted := time.Now()
 			response, err := (&http.Client{Timeout: 5 * time.Second}).Do(request)
 			require.NoError(t, err)
+			reader := bufio.NewReader(response.Body)
+			var firstFrame strings.Builder
 			if tc.ack {
-				assert.Equal(t, "response.created", response.Header.Get("X-Newapi-Early-Ack"))
+				require.Equal(t, "response.created", response.Header.Get("X-Newapi-Early-Ack"))
+				// The first upstream attempt is still blocked on release. A full
+				// acknowledgment here demonstrates real delivery before its answer.
+				for {
+					line, errRead := reader.ReadString('\n')
+					require.NoError(t, errRead)
+					firstFrame.WriteString(line)
+					if strings.TrimSpace(line) == "" {
+						break
+					}
+				}
+				require.Contains(t, firstFrame.String(), "event: response.created")
+				t.Logf("client received response.created in %s", time.Since(requestStarted))
 			}
 			if tc.cancel {
 				select {
@@ -1209,7 +1275,22 @@ func TestResponsesHTTPHealthCountsFinalResult(t *testing.T) {
 				return
 			}
 			unblock()
-			body, err := io.ReadAll(response.Body)
+			if tc.backupPrefix != "" {
+				// The upstream holds its terminal until a real answer delta has
+				// reached this client. An early ack alone cannot pass this test.
+				for {
+					line, errRead := reader.ReadString('\n')
+					require.NoError(t, errRead)
+					firstFrame.WriteString(line)
+					if strings.HasPrefix(line, "data: ") && strings.Contains(line, `"visible prefix"`) {
+						break
+					}
+				}
+				t.Logf("client received first answer text in %s", time.Since(requestStarted))
+				close(allowTerminal)
+			}
+			remaining, err := io.ReadAll(reader)
+			body := firstFrame.String() + string(remaining)
 			require.NoError(t, err)
 			require.NoError(t, response.Body.Close())
 			select {
@@ -1226,6 +1307,13 @@ func TestResponsesHTTPHealthCountsFinalResult(t *testing.T) {
 				assert.Empty(t, failureLogs, "a recovered attempt is visible only in the final request's attempt history")
 				assertResponsesWSAccounting(t, fixture, []int{1000})
 				require.NoError(t, model.LOG_DB.Where("token_id = ? AND type = ?", fixture.token.Id, model.LogTypeConsume).First(&outcome).Error)
+				if tc.search {
+					assert.Equal(t, 1000, outcome.PromptTokens)
+					assert.Equal(t, 1, outcome.CompletionTokens)
+					assert.NotContains(t, body, "response.web_search_call")
+					assert.NotContains(t, body, "response.reasoning_summary_text.delta")
+					assert.NotContains(t, body, "response.output_text.delta")
+				}
 				finalAction = "success"
 			} else {
 				require.Len(t, failureLogs, 1)
@@ -1251,34 +1339,58 @@ func TestResponsesHTTPHealthCountsFinalResult(t *testing.T) {
 			}
 			require.NoError(t, common.UnmarshalJsonStr(outcome.Other, &detail))
 			assert.Equal(t, !tc.success, detail.Admin.FinalRequestError)
-			require.Len(t, detail.Admin.Channels, tc.attempts)
+			expectedChannels := []string{fmt.Sprint(firstChannelID)}
+			if tc.attempts == 2 {
+				expectedChannels = append(expectedChannels, fmt.Sprint(fixture.channel.Id))
+			}
+			require.Equal(t, expectedChannels, detail.Admin.Channels)
 			assert.Equal(t, fmt.Sprint(outcome.ChannelId), detail.Admin.Channels[tc.attempts-1])
 			require.NotEmpty(t, detail.Admin.Policy)
 			assert.Equal(t, finalAction, detail.Admin.Policy[len(detail.Admin.Policy)-1].Decision.Action)
 			if tc.stream && tc.success {
 				commit := persistedResponsesCommit(t, outcome)
 				require.NotNil(t, commit)
-				assert.Equal(t, "response.completed", commit["event_type"])
+				if tc.backupPrefix == "" {
+					assert.Equal(t, "response.completed", commit["event_type"])
+					assert.Equal(t, false, commit["has_output_text"])
+				}
 				assert.Equal(t, "event_forwarded", commit["reason"])
-				assert.Equal(t, false, commit["has_output_text"])
-				assert.NotContains(t, string(body), "discarded")
-				assert.NotContains(t, string(body), "response.failed")
-				assert.Equal(t, 1, strings.Count(string(body), "event: response.completed"))
-				assert.Equal(t, 1, strings.Count(string(body), "event: response.created"))
+				if tc.backupPrefix != "" && !tc.ack {
+					assert.Contains(t, body, `"id":"discarded"`)
+					resolved, errResolve := service.ResolveEarlyResponseAlias(fixture.user.Id, fixture.channel.Id, "discarded")
+					require.NoError(t, errResolve)
+					assert.Equal(t, "winner", resolved, "the original public ID must continue on the winning channel")
+				} else {
+					assert.NotContains(t, body, "discarded")
+				}
+				assert.NotContains(t, body, "response.failed")
+				assert.Equal(t, 1, strings.Count(body, "event: response.completed"))
+				assert.Equal(t, 1, strings.Count(body, "event: response.created"))
+			}
+			if tc.backupPrefix != "" {
+				assert.Equal(t, 1, strings.Count(body, `"delta":"visible prefix"`))
+				assert.NotContains(t, body, "msg_B")
+				assert.NotContains(t, body, `"conflicting answer"`)
+				if tc.success {
+					assert.Contains(t, body, `"delta":"unique suffix"`)
+				} else {
+					assert.NotContains(t, body, "unique suffix")
+					assert.NotContains(t, body, "event: response.completed")
+				}
 			}
 			assert.Equal(t, int64(tc.attempts), attempts.Load())
 			if !tc.success {
-				if tc.ack {
+				if tc.ack || tc.backupPrefix != "" {
 					assert.Equal(t, http.StatusOK, response.StatusCode)
-					assert.Equal(t, 1, strings.Count(string(body), "event: response.failed"))
+					assert.Equal(t, 1, strings.Count(body, "event: response.failed"))
 				} else {
 					assert.Equal(t, tc.firstStatus, response.StatusCode)
 				}
 				if tc.failAll {
-					assert.Contains(t, string(body), "upstream_stream_read_error")
-					assert.Contains(t, string(body), "Upstream response stream was interrupted")
-					assert.NotContains(t, string(body), "response.completed")
-					assert.NotContains(t, string(body), "[DONE]")
+					assert.Contains(t, body, "upstream_stream_read_error")
+					assert.Contains(t, body, "Upstream response stream was interrupted")
+					assert.NotContains(t, body, "response.completed")
+					assert.NotContains(t, body, "[DONE]")
 				}
 			} else {
 				assert.Equal(t, http.StatusOK, response.StatusCode)

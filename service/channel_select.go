@@ -120,8 +120,9 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 	userGroup := common.GetContextKeyString(param.Ctx, constant.ContextKeyUserGroup)
 	filters := GetChannelConstraints(param.Ctx).Filters
 
-	if common.GetContextKeyBool(param.Ctx, constant.ContextKeyResponsesChannelFailover) {
-		return selectResponsesFailoverChannel(param, filters)
+	nativeResponses := common.GetContextKeyBool(param.Ctx, constant.ContextKeyResponsesChannelFailover)
+	if nativeResponses || (common.GetContextKeyBool(param.Ctx, constant.ContextKeyModelChannelFailover) && len(param.Ctx.GetStringSlice("use_channel")) > 0) {
+		return selectUntriedChannel(param, filters, nativeResponses)
 	}
 
 	if param.TokenGroup == "auto" {
@@ -209,9 +210,9 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 	return channel, selectGroup, nil
 }
 
-// selectResponsesFailoverChannel picks the highest remaining priority after
+// selectUntriedChannel picks the highest remaining priority after
 // applying the attempt trail. The outer loop owns the request's retry budget.
-func selectResponsesFailoverChannel(param *RetryParam, filters []dto.ChannelFilter) (*model.Channel, string, error) {
+func selectUntriedChannel(param *RetryParam, filters []dto.ChannelFilter, nativeResponses bool) (*model.Channel, string, error) {
 	attempted := make(map[int]bool)
 	for _, rawID := range param.Ctx.GetStringSlice("use_channel") {
 		if id, err := strconv.Atoi(rawID); err == nil {
@@ -219,7 +220,7 @@ func selectResponsesFailoverChannel(param *RetryParam, filters []dto.ChannelFilt
 		}
 	}
 	filters = append(slices.Clip(filters), dto.ChannelFilter{
-		Kind: dto.FilterResponsesFailover, RequestPath: param.RequestPath, AttemptedChannelIDs: attempted,
+		Kind: dto.FilterRelayFailover, RequestPath: param.RequestPath, AttemptedChannelIDs: attempted, NativeResponsesOnly: nativeResponses,
 	})
 	if param.TokenGroup != "auto" {
 		channel, err := model.GetRandomSatisfiedChannel(param.TokenGroup, param.ModelName, 0, filters)
@@ -230,7 +231,11 @@ func selectResponsesFailoverChannel(param *RetryParam, filters []dto.ChannelFilt
 	groups := GetRequestAutoGroups(param.Ctx, common.GetContextKeyString(param.Ctx, constant.ContextKeyUserGroup))
 	start := slices.Index(groups, current)
 	if start < 0 {
-		return nil, current, nil
+		current = RequestPolicy(param.Ctx).SelectedGroup
+		start = slices.Index(groups, current)
+		if start < 0 {
+			return nil, current, nil
+		}
 	}
 	ordered := []string{current}
 	if common.GetContextKeyBool(param.Ctx, constant.ContextKeyTokenCrossGroupRetry) {
